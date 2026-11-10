@@ -3,25 +3,35 @@ scoring weights, check rules and timeouts. Edit this file, not agent.py."""
 
 # ---------------------------------------------------------------------------
 # Seller profile (assumption A1: one seller, set once).
-# EXAMPLE CONTENT - replace with the real seller before demoing.
-# proof_points is intentionally empty: the draft may cite anything listed here,
-# so only add facts you can stand behind.
+# Zamp (zamp.ai), from its homepage as read on 2026-11-10.
+# The draft may cite anything in proof_points, so each one is copied verbatim
+# from zamp.ai. Re-check them before a real campaign.
 # ---------------------------------------------------------------------------
 SELLER_PROFILE = {
-    "product": "Clearbook",
-    "one_liner": "AI agents that automate accounts-payable work for finance teams: "
-                 "invoice intake, PO matching, approvals and vendor queries.",
+    "product": "Zamp",
+    "one_liner": "A digital workforce for finance operations: AI digital employees that run "
+                 "ongoing finance jobs end to end (AP approvals, invoice processing and audit, "
+                 "purchase requisitions, accounting close, chargebacks) and involve people only when needed.",
     "function": "finance",  # used by the Stage 2 hiring query
-    "buyers": ["CFO", "VP Finance", "Controller", "Head of Finance Operations",
-               "Head of Accounts Payable"],
+    "buyers": ["CFO", "Controller", "Chief Accounting Officer", "VP Finance",
+               "Head of Finance Operations", "Head of Accounts Payable", "Head of Procurement",
+               "Head of Shared Services", "Head of Payments / Disputes Operations"],
     "problems_solved": [
-        "Manual invoice entry and three-way PO matching that does not scale with volume",
-        "Finance teams that must grow headcount every time the company grows",
-        "Slow month-end close caused by unreconciled payables",
-        "Vendor emails and payment-status queries eating AP team time",
-        "Integrating finance operations after an acquisition or expansion into new entities",
+        "Slow AP approvals and manual invoice processing that do not scale with volume",
+        "Purchase requisitions stuck in long approval chains",
+        "A month-end accounting close with too many manual touchpoints",
+        "Invoice audit that is slow or outsourced to a costly BPO",
+        "Chargeback and dispute backlogs that risk missing card-network deadlines",
+        "Finance teams that must add headcount every time transaction volume grows",
     ],
-    "proof_points": [],
+    "proof_points": [
+        "Reduced Instacart's AP approval times from 2 weeks to 2 days, automating 80% of manual work",
+        "Automated 85% of Amgen's purchase requisitions through approval, cutting turnaround time 60%",
+        "Eliminated 75% of human touchpoints in Block's accounting close process",
+        "Reduced Uber Freight's invoice audit time from 1 day to 1 hour, at 30% lower cost than a BPO",
+        "Filed chargebacks in under 10 minutes per case at Wio, with zero missed network deadlines",
+        "Processed 95%+ of Mindbody's invoices end-to-end, involving humans only when needed",
+    ],
     "allowed_ctas": [
         "Worth a 15-minute call next week?",
         "Want me to send over a one-pager?",
@@ -33,29 +43,125 @@ SELLER_PROFILE = {
 }
 
 # ---------------------------------------------------------------------------
+# Stage 1 - lookup of a missing prospect name or role (one of the two is given)
+# ---------------------------------------------------------------------------
+NAME_LOOKUP_QUERIES = [            # name missing: who is the {role} of {company}? (web search)
+    '"{company}" {role}',
+    '{role} of {company} linkedin',
+]
+NAME_LOOKUP_NEWS_QUERIES = [       # news search: dated, so a recent appointment can beat older coverage
+    '"{company}" {role} appointed OR joins OR named',
+    '"{company}" new {role} OR succeeds OR replaces OR "steps down"',
+]
+NAME_LOOKUP_SITE_QUERY = "site:{domain} {role} OR leadership OR team"
+ROLE_LOOKUP_QUERIES = [            # role missing: what is {name}'s title at {company}?
+    '"{name}" "{company}"',
+    '"{name}" {company} title OR role',
+    '"{name}" {company} linkedin',
+]
+ROLE_LOOKUP_NEWS_QUERIES = [
+    '"{name}" "{company}" appointed OR promoted OR joins OR named',
+]
+ROLE_LOOKUP_SITE_QUERY = 'site:{domain} "{name}"'
+# A candidate with a dated source this recent beats candidates with more but older
+# (or undated) sources: after a change of CFO, older coverage still names the predecessor.
+LOOKUP_RECENT_DAYS = 365
+
+# ---------------------------------------------------------------------------
 # Stage 2 - query templates
 # ---------------------------------------------------------------------------
+# Trigger events (indirect hooks) first, then the seller's problems (direct hooks).
 COMPANY_QUERIES = [
-    '"{company}" funding',
     '"{company}" news',
-    '"{company}" hiring {function}',
-    '"{company}" launch OR expansion OR acquisition',
+    '"{company}" funding OR raises OR valuation',
+    '"{company}" acquisition OR acquires OR merger OR expansion',
+    '"{company}" revenue OR earnings OR growth',
+    '"{company}" CFO OR "chief financial officer" OR controller appointed',
+    '"{company}" hiring {function} OR "accounts payable" OR procurement',
+    '"{company}" "accounts payable" OR invoices OR "month-end close" OR procurement',
+    '"{company}" "finance transformation" OR ERP OR "shared services" OR chargebacks',
 ]
 PERSON_QUERIES = [
-    '"{name}" {company} interview OR podcast',
     '"{name}" {company}',
+    '"{name}" {company} interview OR podcast OR keynote',
     '"{name}" {company} appointed OR joins OR promoted',
+    '"{name}" {company} finance OR automation OR AI',
 ]
 WEBSITE_QUERY = "site:{domain} news OR announcement OR blog"
 
 # ---------------------------------------------------------------------------
-# Stage 3 - gathering
+# Stage 3 - gathering and ranking
+# Every result is scored against these anchors plus SELLER_PROFILE
+# ["problems_solved"]; a result's score is its best match. Trigger anchors
+# describe events that CREATE the seller's problems, so funding or M&A news
+# is not ranked low just because it never mentions invoices.
 # ---------------------------------------------------------------------------
+TRIGGER_ANCHORS = [
+    "raised a funding round, new investment or higher valuation",
+    "acquired a company or announced a merger",
+    "expanding into new countries, markets or business entities",
+    "strong revenue growth, earnings results or rising transaction volume",
+    "appointed a new CFO, controller or finance leader",
+    "hiring accounts payable, procurement or finance operations staff",
+    "finance transformation, ERP migration or shared services centre",
+    "cost cutting, efficiency programme or restructuring",
+    "rising fraud, chargebacks or payment disputes",
+    "executive talking about finance automation or AI in finance",
+]
 RESULTS_PER_QUERY = 5
-MAX_SOURCES = 30
+MAX_SOURCES = 30            # top-scoring results kept for Stage 4 (pasted notes are extra)
+MIN_PERSON_SOURCES = 2      # best person-query results always kept, whatever their score
 SEARCH_TIMEOUT_S = 20
 SEARCH_WORKERS = 4          # parallel queries; higher values get rate-limited
-SNIPPET_CHARS = 500         # per source, sent to the LLM
+SNIPPET_CHARS = 750         # per source, sent to the LLM
+
+# Full text (fix for thin hooks): fetch the page of the top-ranked results and
+# send the relevant paragraphs to Stage 4 instead of the short search snippet.
+FETCH_TOP_N = 4             # pages fetched per research round (0 = off)
+FETCH_TIMEOUT_S = 10
+FETCH_MAX_BYTES = 2_000_000
+FULLTEXT_CHARS = 2500       # excerpt per fetched page sent to the LLM
+# Login walls, JS redirects and social sites return no article text.
+FETCH_SKIP_HOSTS = ("news.google.com", "linkedin.com", "facebook.com", "instagram.com", "x.com",
+                    "twitter.com", "youtube.com", "tiktok.com", "reddit.com")
+
+# ---------------------------------------------------------------------------
+# Research rounds (fix for "search finds little" and "nothing relevant").
+# If no signal passes the gate (R >= GATE_MIN_R) after round 1:
+#   round 2 runs the GAP_QUERIES for the gaps found (fixed templates, no LLM),
+#   round 3 asks the LLM for new queries, checked by code (see LLM_QUERY_*).
+# Each later round searches for NEW results only and adds to the earlier signals.
+# ---------------------------------------------------------------------------
+MAX_RESEARCH_ROUNDS = 3     # 1 = no retries
+FEW_RESULTS = 8             # fewer kept results than this = gap "few_results"
+MAX_GAP_QUERIES = 8         # round 2 cap, taken round-robin across the gaps
+GAP_QUERIES = {
+    # Search found little: drop the strict phrasing, disambiguate with the website.
+    "few_results": [
+        "{company} company",
+        "{company} {domain}",
+        '"{company}" about OR "who we are" OR customers',
+        "site:{domain} press OR about OR careers OR blog",
+    ],
+    # No person-level signal: look for the prospect directly.
+    "no_person": [
+        '"{name}" "{role}"',
+        '"{name}" {company} conference OR webinar OR panel OR speaker',
+        '"{name}" {company} said OR says OR quoted',
+        '"{name}" {company} linkedin',
+    ],
+    # Signals exist but none links to the seller: aim at finance triggers.
+    "no_relevant": [
+        '"{company}" "finance team" OR "finance operations" OR "accounting team"',
+        '"{company}" careers accounting OR finance OR controller',
+        '"{company}" subsidiary OR "new entity" OR "opens office" OR "new market"',
+        '"{company}" layoffs OR restructuring OR "cost cutting" OR efficiency',
+        '"{company}" "transaction volume" OR customers OR orders OR "record growth"',
+    ],
+}
+LLM_QUERY_MAX = 5           # round 3: queries accepted from the LLM
+LLM_QUERY_MAX_CHARS = 150
+QUERY_DUP_JACCARD = 0.6     # reject a query this similar to one already run
 
 # ---------------------------------------------------------------------------
 # Stage 4 - signals

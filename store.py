@@ -14,7 +14,7 @@ CREATE TABLE IF NOT EXISTS runs (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     created_at TEXT, name TEXT, company TEXT, role TEXT, website TEXT, notes TEXT,
     status TEXT, current_stage INTEGER, chosen_signal_id INTEGER,
-    duration REAL, error TEXT
+    duration REAL, error TEXT, resolved TEXT, rounds INTEGER, research TEXT
 );
 CREATE TABLE IF NOT EXISTS stage_events (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -24,14 +24,15 @@ CREATE TABLE IF NOT EXISTS stage_events (
 CREATE TABLE IF NOT EXISTS sources (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     run_id INTEGER, url TEXT, title TEXT, snippet TEXT, published_date TEXT,
-    query TEXT, origin TEXT
+    query TEXT, origin TEXT, bucket TEXT, sim REAL, anchor TEXT, kept INTEGER,
+    round INTEGER, fulltext TEXT
 );
 CREATE TABLE IF NOT EXISTS signals (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     run_id INTEGER, type TEXT, level TEXT, summary TEXT, evidence TEXT,
     source_urls TEXT, date TEXT, verified INTEGER, drop_reason TEXT,
     R INTEGER, R_reason TEXT, T REAL, P REAL, score REAL,
-    passed_gate INTEGER, rank INTEGER
+    passed_gate INTEGER, rank INTEGER, round INTEGER
 );
 CREATE TABLE IF NOT EXISTS drafts (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -46,7 +47,12 @@ CREATE TABLE IF NOT EXISTS review_actions (
 );
 """
 
-JSON_COLS = {"payload", "source_urls", "check_results"}
+MIGRATIONS = {"runs": {"resolved": "TEXT", "rounds": "INTEGER", "research": "TEXT"},
+              "sources": {"bucket": "TEXT", "sim": "REAL", "anchor": "TEXT", "kept": "INTEGER",
+                          "round": "INTEGER", "fulltext": "TEXT"},
+              "signals": {"round": "INTEGER"}}
+
+JSON_COLS = {"payload", "source_urls", "check_results", "resolved", "research"}
 
 
 def now_iso():
@@ -68,6 +74,12 @@ def _conn():
 def init_db():
     with _conn() as con:
         con.executescript(SCHEMA)
+        # Databases created before these features lack the columns.
+        for table, cols in MIGRATIONS.items():
+            have = {r["name"] for r in con.execute(f"PRAGMA table_info({table})")}
+            for col, typ in cols.items():
+                if col not in have:
+                    con.execute(f"ALTER TABLE {table} ADD COLUMN {col} {typ}")
 
 
 def _row(r):
@@ -138,7 +150,8 @@ def get_events(run_id):
 def add_sources(run_id, sources):
     for s in sources:
         _insert("sources", {"run_id": run_id, **{k: s.get(k) for k in
-                ("url", "title", "snippet", "published_date", "query", "origin")}})
+                ("url", "title", "snippet", "published_date", "query", "origin", "bucket", "sim", "anchor", "kept",
+                 "round", "fulltext")}})
 
 
 def get_sources(run_id):
@@ -147,7 +160,7 @@ def get_sources(run_id):
 
 # --- signals ----------------------------------------------------------------
 SIGNAL_FIELDS = ("type", "level", "summary", "evidence", "source_urls", "date", "verified",
-                 "drop_reason", "R", "R_reason", "T", "P", "score", "passed_gate", "rank")
+                 "drop_reason", "R", "R_reason", "T", "P", "score", "passed_gate", "rank", "round")
 
 
 def add_signal(run_id, sig):

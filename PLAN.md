@@ -28,7 +28,7 @@ This version covers the happy path only. Edge cases come later. No tool or vendo
 **Assumptions** (the brief asks us to state these and move on):
 
 - **A1. One seller.** A single seller profile (section 4) is set once in config. The rep does not type the value proposition on every run.
-- **A2. Rep input.** Name, company and role are required. Company website and pasted notes (for example, text copied from the prospect's LinkedIn page) are optional.
+- **A2. Rep input.** Company is required, plus the prospect name or role (or both); Stage 1 looks up the missing one by search. Company website and pasted notes (for example, text copied from the prospect's LinkedIn page) are optional. Many prospects can be run from a CSV with `python batch.py prospects.csv`.
 - **A3. Public sources only.** Web search results, plus anything the rep pastes in.
 - **A4. Channel.** Email: a subject line and a short body.
 - **A5. Approve means approve.** It marks the draft approved and copies the text. The system never sends anything.
@@ -65,13 +65,20 @@ Who does what:
 
 | Field | Required | Use |
 |---|---|---|
-| Prospect name | Yes | Person-level search; draft greeting |
+| Prospect name | Name or role | Person-level search; draft greeting |
 | Company | Yes | Company-level search |
-| Role / title | Yes | Relevance to the seller; draft framing |
+| Role / title | Name or role | Relevance to the seller; draft framing |
 | Company website | No | Narrows search to the right company |
 | Pasted notes | No | Added as a source of type `rep_provided` |
 
-Validate that required fields are not empty. Create a run with status `running`.
+Validate: company, plus name or role (error if both are missing). Create a run with status `running`.
+
+**Lookup (only when name or role is missing).** Search tool + LLM + code checks:
+- Name missing: search who is the {role} of {company}. Role missing: search {name}'s title at {company}. A `site:` query is added when a website is given; pasted notes are included.
+- The LLM lists candidates (value, source URL, quote, date, still current?).
+- Code drops a candidate if its URL was not gathered, the source says former/past, the name (or title, or its acronym) is not written in the source, or the source does not mention the company (unless it is on the company's own site).
+- Pick the candidate with the most sources (ties: most recent). Store it with its evidence; the review card asks the rep to confirm it and lists other candidates.
+- Nothing passes: `needs_research` with the reason. All searches fail: `failed`.
 **Live view:** input card.
 
 ### Stage 2 — Plan queries
@@ -90,8 +97,8 @@ Output: about 6–8 queries.
 
 - Run all queries in parallel, each with a timeout.
 - For each result keep: URL, title, snippet, published date (if any), and the query that found it.
-- Remove duplicate URLs. Cap at about 30 sources.
-- Optional: fetch the full text of the top few pages, so you get exact quotes.
+- Remove duplicate URLs. Score every result against the seller's problems and trigger events; keep the top 30.
+- Fetch the full page of the top 4 kept results (skipping login-walled and social sites) and send the paragraphs about the company or prospect (up to 2,500 characters) to Stage 4 instead of the snippet. Other results send their snippet, up to 750 characters.
 - Add pasted notes as one source.
 
 **Live view:** result count per query, then the source list.
@@ -134,7 +141,15 @@ Relevance multiplies the rest, so a recent but irrelevant signal scores zero. Th
 
 **Gate:** R ≥ 2 and the source was verified.
 **Pick:** the highest score. On a tie, the more recent signal wins, then the person-level one. Keep the next two as runner-ups for Regenerate.
-**If nothing passes the gate:** set status `needs_research` and stop. Do not write a hollow draft. (This is a stub; the full behaviour is an edge case for later.)
+**If nothing passes the gate:** run another research round (Stages 2–5 again, new URLs only), up to 3 rounds in total:
+
+| Round | Queries | Why |
+|---|---|---|
+| 1 | Fixed templates (Stage 2) | Predictable, visible |
+| 2 | Fixed gap templates, chosen by what is missing: few results → broader queries and the website; no person-level signal → the prospect's talks, quotes, profile; nothing finance-related → finance team, entities, restructuring, volume | Cheap, no LLM, explains itself |
+| 3 | Up to 5 queries written by the LLM from what was found and what is missing | Adapts to the company. Code rejects queries without the company name, `site:` for other domains, and near-duplicates of earlier queries |
+
+New signals that report an event found earlier are merged into it; only new signals are rated. If no signal passes after the last round, set status `needs_research` with the reason. Do not write a hollow draft. A failure in round 2 or 3 stops the retries but does not fail the run.
 
 Worked example:
 

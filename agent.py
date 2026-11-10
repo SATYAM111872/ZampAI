@@ -4,7 +4,9 @@ Each stage is one function that reads/writes the run state and emits a
 StageEvent (started / done / failed / skipped). The UI renders the events live;
 the dashboard replays the same stored events.
 
-CLI:  python agent.py "Prospect Name" "Company" "Role" [--website URL] [--notes TEXT]
+CLI:  python agent.py "Company" [--name NAME] [--role ROLE] [--website URL] [--notes TEXT]
+      (give --name, --role or both; Stage 1 looks up the missing one)
+Batch: python batch.py prospects.csv
 """
 
 import argparse
@@ -21,8 +23,8 @@ from pydantic import BaseModel, Field
 import config as C
 import prompts as PR
 import store
-from llm import llm
-from search import search as search_tool
+from llm import embeddings, llm
+from search import fetch_paragraphs, search as search_tool
 
 store.init_db()
 
@@ -50,6 +52,28 @@ class ExtractedSignal(BaseModel):
 
 class Extraction(BaseModel):
     signals: list[ExtractedSignal]
+
+
+class LookupCandidate(BaseModel):
+    value: str = Field(description="the person's full name, or the job title, as written in the source")
+    source_url: str
+    evidence: str
+    date: Optional[str] = Field(None, description="YYYY-MM-DD, or null if the source shows no date")
+    current: bool = Field(True, description="false if the source says this is a former/past holder or job")
+
+
+class Lookup(BaseModel):
+    candidates: list[LookupCandidate]
+
+
+class PlannedQuery(BaseModel):
+    query: str
+    bucket: Literal["company", "person"]
+    reason: str
+
+
+class QueryPlan(BaseModel):
+    queries: list[PlannedQuery]
 
 
 class Rating(BaseModel):
@@ -240,14 +264,134 @@ def core_text(parts):
 
 
 # =============================================================================
-# Stage 1 - Input
+# Stage 1 - Input, plus lookup of a missing name or role (search tool + LLM)
 # =============================================================================
-REQUIRED = ("name", "company", "role")
-
-
 def validate_input(p):
-    """Returns a list of missing required fields (empty = valid)."""
-    return [f for f in REQUIRED if not (p.get(f) or "").strip()]
+    """Returns the missing required fields (empty = valid). Company is required,
+    plus the prospect name or role (or both); Stage 1 looks up a missing one."""
+    missing = [] if (p.get("company") or "").strip() else ["company"]
+    if not (p.get("name") or "").strip() and not (p.get("role") or "").strip():
+        missing.append("name or role")
+    return missing
+
+
+_HONORIFIC = re.compile(r"^(?:(?:dr|mr|mrs|ms|mx|prof|sir|dame)\b\.?\s*)+", re.I)
+
+
+def clean_name(n):
+    """'Dr. Jane Doe, CPA' -> 'Jane Doe'. The draft greets by the first word."""
+    n = " ".join((n or "").split()).split(",")[0]
+    return _HONORIFIC.sub("", n).strip(" .")
+
+
+def lookup_queries(p, field):
+    """field='name': who is the {role} of {company}; field='role': {name}'s title there."""
+    fill = {"name": p["name"], "role": p["role"], "company": p["company"]}
+    if field == "name":
+        templates, site = C.NAME_LOOKUP_QUERIES, C.NAME_LOOKUP_SITE_QUERY
+    else:
+        templates, site = C.ROLE_LOOKUP_QUERIES, C.ROLE_LOOKUP_SITE_QUERY
+    # "person" bucket: web results first (LinkedIn and team pages carry names and titles).
+    qs = [{"bucket": "person", "query": t.format(**fill)} for t in templates]
+    dom = domain_of(p.get("website"))
+    if dom:
+        qs.append({"bucket": "person", "query": site.format(domain=dom, **fill)})
+    return qs
+
+
+def _on_site(url, website):
+    dom = domain_of(website)
+    host = urlsplit(url or "").netloc.lower().removeprefix("www.")
+    return bool(dom) and (host == dom or host.endswith("." + dom))
+
+
+def _title_words(title):
+    return [w for w in words(title) if w not in _STOP]
+
+
+def _title_in(title, text):
+    """The title is written in the source, word for word or as its acronym
+    ('Chief Financial Officer' ~ 'CFO')."""
+    tw, sw = _title_words(title), set(words(text))
+    return bool(tw) and (set(tw) <= sw or (len(tw) > 1 and "".join(w[0] for w in tw) in sw))
+
+
+def _role_key(title):
+    """Groups 'Chief Financial Officer' with 'CFO' so they don't look like rivals."""
+    tw = _title_words(title)
+    return "".join(w[0] for w in tw) if len(tw) > 1 else " ".join(tw)
+
+
+def _check_candidate(c, field, p, src):
+    """Code checks on one LLM lookup candidate. Returns a drop reason, or None."""
+    if not c["current"]:
+        return "source says this is a former holder / past job"
+    text = f"{src.get('title') or ''} {src.get('snippet') or ''}"
+    if field == "name":
+        if len(c["value"].split()) < 2:
+            return "not a full name"
+        if not _mentions_person(text, c["value"]):
+            return "name is not written in the source"
+    else:
+        if not _mentions_person(text, p["name"]):
+            return "source does not mention the prospect"
+        if not _title_in(c["value"], text):
+            return "title is not written in the source"
+    if (src["origin"] != "rep_provided" and not mentions_company(text, p["company"])
+            and not _on_site(src["url"], p.get("website"))):
+        return "source does not mention the company (possible namesake or other company)"
+    return None
+
+
+def lookup_prospect(p, field):
+    """Find the missing name (field='name') or role (field='role') by web search.
+    Returns (value or None, info); info lists every candidate and drop reason.
+    Raises StageError if every search fails (and no notes) or the LLM call fails."""
+    queries = lookup_queries(p, field)
+    sources, counts, errors = gather_sources(queries, p["notes"], rank=False)  # ~20 results: nothing to cut
+    info = {"field": field, "queries": queries, **counts, "errors": errors, "sources": sources,
+            "candidates": [], "dropped": [], "chosen": None}
+    if not sources:
+        return None, info
+
+    fmt = {"name": p["name"], "role": p["role"], "company": p["company"]}
+    sys = (PR.LOOKUP_NAME_SYSTEM if field == "name" else PR.LOOKUP_ROLE_SYSTEM).format(**fmt)
+    user = PR.LOOKUP_USER.format(today=date.today().isoformat(), sources=_sources_block(sources))
+    raw = call_llm(Lookup, sys, user).candidates
+
+    by_url = {norm_url(s["url"]): s for s in sources}
+    groups = {}
+    for c in (x.model_dump() for x in raw):
+        c["value"] = clean_name(c["value"]) if field == "name" else " ".join(c["value"].split()).strip(" ,.")
+        src = by_url.get(norm_url(c["source_url"]))
+        reason = "source_url was not gathered" if src is None else _check_candidate(c, field, p, src)
+        if reason:
+            info["dropped"].append({**c, "drop_reason": reason})
+            continue
+        d = parse_date(c["date"]) or parse_date(src.get("published_date"))
+        key = " ".join(words(c["value"])) if field == "name" else _role_key(c["value"])
+        g = groups.setdefault(key, {"value": c["value"], "sources": [], "evidence": [], "latest": None})
+        if src["url"] not in g["sources"]:
+            g["sources"].append(src["url"])
+            g["evidence"].append(c["evidence"])
+        if d and (g["latest"] is None or d.isoformat() > g["latest"]):
+            g["latest"] = d.isoformat()
+    # Most supporting sources first; ties -> most recent dated source.
+    info["candidates"] = sorted(groups.values(), key=lambda g: (len(g["sources"]), g["latest"] or ""),
+                                reverse=True)
+    if info["candidates"]:
+        info["chosen"] = info["candidates"][0]["value"]
+    return info["chosen"], info
+
+
+def lookup_record(info):
+    """The part of a lookup the review card shows (stored on the run)."""
+    best = info["candidates"][0] if info["candidates"] else None
+    return {"field": info["field"], "value": info["chosen"],
+            "evidence": best["evidence"][0] if best else None,
+            "sources": best["sources"] if best else [],
+            "latest": best["latest"] if best else None,
+            "alternatives": [{"value": c["value"], "sources": c["sources"]} for c in info["candidates"][1:]]}
 
 
 # =============================================================================
@@ -267,7 +411,12 @@ def plan_queries(p):
 # =============================================================================
 # Stage 3 - Gather sources (search tool)
 # =============================================================================
-def gather_sources(queries, notes):
+def gather_sources(queries, notes, rank=True, exclude=frozenset()):
+    """Run the queries, dedupe the results and (rank=True) keep the top
+    MAX_SOURCES by similarity to the seller (see rank_sources). Pasted notes are
+    always added. `exclude` = normalised URLs seen in earlier research rounds.
+    Returns (kept sources, info, errors); info["cut"] holds the results that
+    were scored but not kept."""
     per_query, errors = {}, {}
     pool = ThreadPoolExecutor(max_workers=C.SEARCH_WORKERS)
     try:
@@ -289,39 +438,191 @@ def gather_sources(queries, notes):
     if len(errors) == len(queries) and not (notes or "").strip():
         raise StageError(f"all {len(queries)} searches failed: {list(errors.values())[0]}")
 
-    # Round-robin across queries so every query contributes before the cap; dedupe URLs.
-    seen, sources = set(), []
+    counts = {q: len(v) for q, v in per_query.items()}
+    # Dedupe URLs, taking results round-robin across queries (so equal scores keep each query's best first).
+    bucket = {q["query"]: q["bucket"] for q in queries}
+    seen, pool = set(), []
     lists = [list(v) for v in per_query.values()]
-    while any(lists) and len(sources) < C.MAX_SOURCES:
+    while any(lists):
         for lst in lists:
-            if lst and len(sources) < C.MAX_SOURCES:
+            if lst:
                 s = lst.pop(0)
                 key = norm_url(s["url"])
-                if key not in seen:
+                if key not in seen and key not in exclude:
                     seen.add(key)
-                    sources.append(s)
+                    pool.append({**s, "bucket": bucket.get(s["query"])})
+    if rank:
+        sources, cut, method = rank_sources(pool)
+    else:
+        sources, cut, method = pool[:C.MAX_SOURCES], pool[C.MAX_SOURCES:], None
     if (notes or "").strip():
         sources.append({"url": NOTES_URL, "title": "Notes pasted by rep", "snippet": notes.strip(),
-                        "published_date": None, "query": None, "origin": "rep_provided"})
-    counts = {q: len(v) for q, v in per_query.items()}
+                        "published_date": None, "query": None, "origin": "rep_provided", "kept": 1})
     backends = {}
     for s in sources:
         b = s.get("backend") or s["origin"]
         backends[b] = backends.get(b, 0) + 1
-    return sources, {"per_query": counts, "backends": backends}, errors
+    return sources, {"per_query": counts, "backends": backends, "gathered": len(pool),
+                     "ranking": method, "cut": cut}, errors
+
+
+def source_anchors():
+    return list(C.SELLER_PROFILE["problems_solved"]) + list(C.TRIGGER_ANCHORS)
+
+
+def _source_text(s):
+    return f"{s.get('title') or ''}. {s.get('snippet') or ''}"[:C.SNIPPET_CHARS]
+
+
+def _unit(v):
+    n = sum(x * x for x in v) ** 0.5 or 1.0
+    return [x / n for x in v]
+
+
+_anchor_vecs = {}
+
+
+def _embedding_scores(anchors, texts):
+    """Best cosine similarity of each text to any anchor -> [(score, anchor index)]."""
+    def run():
+        key = tuple(anchors)
+        if key not in _anchor_vecs:  # anchors are fixed per process: embed once
+            _anchor_vecs[key] = [_unit(v) for v in embeddings.embed_documents(list(anchors))]
+        return _anchor_vecs[key], [_unit(v) for v in embeddings.embed_documents(texts)]
+    A, T = _llm_pool.submit(run).result(timeout=C.LLM_TIMEOUT_S)
+    return [max((sum(x * y for x, y in zip(t, a)), j) for j, a in enumerate(A)) for t in T]
+
+
+def _stem(w):
+    for suf in ("ing", "ed", "es", "s"):
+        if w.endswith(suf) and len(w) - len(suf) >= 4:
+            return w[:-len(suf)]
+    return w
+
+
+def _bag(s):
+    return {_stem(w) for w in words(s) if w not in _STOP and len(w) > 2}
+
+
+def _keyword_scores(anchors, texts):
+    """Fallback: share of an anchor's words found in the text, best anchor."""
+    A = [_bag(a) for a in anchors]
+    out = []
+    for t in texts:
+        tb = _bag(t)
+        out.append(max((len(a & tb) / len(a) if a else 0.0, j) for j, a in enumerate(A)))
+    return out
+
+
+def rank_sources(pool):
+    """Score every result against the anchors (seller problems + trigger events)
+    and keep the top MAX_SOURCES, always including the best MIN_PERSON_SOURCES
+    person-query results. Returns (kept, cut, method); each result gets sim, anchor, kept."""
+    if not pool:
+        return [], [], None
+    anchors, texts = source_anchors(), [_source_text(s) for s in pool]
+    try:
+        scores, method = _embedding_scores(anchors, texts), "embedding"
+    except Exception as e:  # quota, network, timeout: rank anyway, never fail the run here
+        scores = _keyword_scores(anchors, texts)
+        method = f"keyword overlap (embedding failed: {type(e).__name__}: {str(e)[:150]})"
+    for s, (sc, j) in zip(pool, scores):
+        s["sim"], s["anchor"] = round(sc, 3), anchors[j]
+    order = sorted(range(len(pool)), key=lambda i: pool[i]["sim"], reverse=True)  # stable: ties keep round-robin order
+    person = [i for i in order if pool[i]["bucket"] == "person"][:C.MIN_PERSON_SOURCES]
+    keep = set((person + [i for i in order if i not in person])[:C.MAX_SOURCES])
+    kept = [pool[i] for i in order if i in keep]
+    cut = [pool[i] for i in order if i not in keep]
+    for s in kept:
+        s["kept"] = 1
+    for s in cut:
+        s["kept"] = 0
+    return kept, cut, method
+
+
+def _fetchable(url):
+    try:
+        host = (urlsplit(url or "").hostname or "").lower().removeprefix("www.")
+    except ValueError:  # malformed URL from a search backend
+        return False
+    return bool(host) and url.startswith(("http://", "https://")) and not any(
+        host == h or host.endswith("." + h) for h in C.FETCH_SKIP_HOSTS)
+
+
+def page_excerpt(paras, p, limit=None):
+    """The lede (first 2 paragraphs) plus paragraphs that mention the company or
+    the prospect, in page order; padded with the rest if that is short."""
+    limit = limit or C.FULLTEXT_CHARS
+    last = (p.get("name") or "").split()[-1:]
+
+    def relevant(t):
+        return mentions_company(t, p["company"]) or bool(last and re.search(rf"\b{re.escape(last[0])}\b", t))
+    picked = [i for i, t in enumerate(paras) if i < 2 or relevant(t)]
+    if sum(len(paras[i]) for i in picked) < limit // 2:
+        picked = list(range(len(paras)))
+    out, n = [], 0
+    for i in picked:
+        if n >= limit:
+            break
+        out.append(paras[i])
+        n += len(paras[i]) + 1
+    return " ".join(out)[:limit]
+
+
+def fetch_full_text(sources, p):
+    """Fetch the pages of the top FETCH_TOP_N fetchable sources (already in rank
+    order) and set s["fulltext"]. Failures leave the snippet in place.
+    Returns {url: "ok" | error}."""
+    targets = [s for s in sources if s["origin"] == "search" and _fetchable(s["url"])][:C.FETCH_TOP_N]
+    if not targets:
+        return {}
+    status = {}
+    pool = ThreadPoolExecutor(max_workers=len(targets))
+    try:
+        futs = {s["url"]: (s, pool.submit(fetch_paragraphs, s["url"])) for s in targets}
+        deadline = time.time() + C.FETCH_TIMEOUT_S * 2
+        for url, (s, fut) in futs.items():
+            try:
+                paras = fut.result(timeout=max(1, deadline - time.time()))
+                if not any(mentions_company(t, p["company"]) for t in paras):
+                    status[url] = "page does not mention the company"
+                    continue
+                text = page_excerpt(paras, p)
+            except FutTimeout:
+                status[url] = "timeout"
+                continue
+            except Exception as e:
+                status[url] = f"{type(e).__name__}: {str(e)[:120]}"
+                continue
+            # Too little text means a paywall, consent page or JS-only site: keep the snippet.
+            if len(text) < len(s.get("snippet") or "") + 200:
+                status[url] = "no article text"
+                continue
+            s["fulltext"] = text
+            status[url] = "ok"
+    finally:
+        pool.shutdown(wait=False, cancel_futures=True)
+    return status
 
 
 # =============================================================================
 # Stage 4 - Extract signals (LLM) + code checks + merge
 # =============================================================================
+def _source_body(s):
+    """What Stage 4 reads: pasted notes in full, a fetched page's excerpt, else the snippet."""
+    if s["origin"] == "rep_provided":
+        return s.get("snippet") or ""
+    if s.get("fulltext"):
+        return s["fulltext"][:C.FULLTEXT_CHARS]
+    return (s.get("snippet") or "")[:C.SNIPPET_CHARS]
+
+
 def _sources_block(sources):
     blocks = []
     for i, s in enumerate(sources, 1):
-        snippet = (s.get("snippet") or "")
-        if s["origin"] != "rep_provided":
-            snippet = snippet[:C.SNIPPET_CHARS]
+        kind = "full article excerpt" if s.get("fulltext") and s["origin"] != "rep_provided" else "text"
         blocks.append(f"[S{i}] url: {s['url']}\ntitle: {s.get('title') or ''}\n"
-                      f"published: {s.get('published_date') or 'unknown'}\ntext: {snippet}")
+                      f"published: {s.get('published_date') or 'unknown'}\n{kind}: {_source_body(s)}")
     return "\n\n".join(blocks)
 
 
@@ -343,18 +644,29 @@ def mentions_company(text, company):
     return bool(core) and re.search(rf"(?<!\w){re.escape(core)}(?!\w)", text or "", re.I) is not None
 
 
-def _mentions_person(text, name):
-    t = (text or "").lower()
-    n = name.lower().strip()
-    if n in t:
+def _has_word(text, phrase):
+    return re.search(rf"(?<!\w){re.escape(phrase)}(?!\w)", text) is not None
+
+
+def _mentions_person(text, name, full_name_only=False):
+    """Whole-word match ('Doe' must not match 'does'). Short texts may give first
+    and last name separately; long ones (full articles) need the full name."""
+    t = " ".join((text or "").lower().split())
+    n = " ".join((name or "").lower().split())
+    if not n:
+        return False
+    if _has_word(t, n):
         return True
     parts = [x for x in n.split() if len(x) > 1]
-    return len(parts) >= 2 and parts[0] in t and parts[-1] in t
+    return not full_name_only and len(parts) >= 2 and _has_word(t, parts[0]) and _has_word(t, parts[-1])
 
 
-def extract_signals(p, sources):
+def extract_signals(p, sources, existing=()):
+    """Returns (new signals, dropped, grown). `existing` = verified signals from
+    earlier research rounds: a new report of the same event is merged into it
+    (it is then in `grown`) instead of becoming a new signal."""
     if not sources:
-        return [], []
+        return [], [], []
     sys = PR.EXTRACT_SYSTEM.format(types=", ".join(C.SIGNAL_TYPES), company=p["company"], name=p["name"])
     user = PR.EXTRACT_USER.format(name=p["name"], role=p["role"], company=p["company"],
                                   today=date.today().isoformat(), sources=_sources_block(sources))
@@ -373,15 +685,19 @@ def extract_signals(p, sources):
             sig["date"] = None
         if sig["date"] is None and parse_date(src.get("published_date")):
             sig["date"] = parse_date(src["published_date"]).isoformat()
-        text = f"{src.get('title') or ''} {src.get('snippet') or ''}"
+        short = f"{src.get('title') or ''} {src.get('snippet') or ''}"
+        full = src.get("fulltext") or ""
+        # In a long article, first and last name apart are weak evidence: require the full name there.
+        person_ok = _mentions_person(short, p["name"]) or _mentions_person(full, p["name"], full_name_only=True)
         if (sig["level"] == "person" and src["origin"] != "rep_provided"
-                and not (_mentions_person(text, p["name"]) and mentions_company(text, p["company"]))):
+                and not (person_ok and mentions_company(f"{short} {full}", p["company"]))):
             dropped.append({**sig, "drop_reason": "person-level, but source does not mention both "
                                                   "the prospect's name and company (possible namesake)"})
             continue
         kept.append(sig)
     exclude = {w.lower() for w in re.findall(r"\w+", f"{p['name']} {p['company']}")}
-    return merge_signals(kept, exclude), dropped
+    new, grown = merge_signals(kept, exclude, existing)
+    return new, dropped, grown
 
 
 _GENERIC_CAPS = {"the", "a", "an", "ai", "crm", "ceo", "cto", "cfo", "coo", "vp", "inc", "ltd", "llc", "co",
@@ -395,19 +711,25 @@ def key_entities(text, exclude):
     return {t.lower() for t in toks} - _GENERIC_CAPS - exclude
 
 
-def merge_signals(sigs, exclude=frozenset()):
+def merge_signals(sigs, exclude=frozenset(), existing=()):
     """Merge the same event reported by several outlets (heuristic): same type and
     level, dates within MERGE_MAX_DAYS (or both undated), and either overlapping
-    summaries (Jaccard) or a shared distinctive entity such as the acquired company."""
-    merged = []
+    summaries (Jaccard) or a shared distinctive entity such as the acquired company.
+    `existing` signals (earlier research rounds) can absorb new reports; they are
+    updated in place. Returns (new merged signals, existing signals that grew)."""
+    groups = []
+    for e in existing:
+        d0 = parse_date(e["date"])
+        groups.append({"sig": e, "dates": [d0] if d0 else [], "ents": key_entities(e["summary"], exclude),
+                       "old": True, "grew": False})
     for s in sigs:
         d = parse_date(s["date"])
         s_ents = key_entities(s["summary"], exclude)
-        for m in merged:
-            mdates = m["_dates"]
+        for g in groups:
+            m, mdates = g["sig"], g["dates"]
             # An undated report is compatible with any date (outlets often omit it).
             same_time = d is None or not mdates or any(abs((d - x).days) <= C.MERGE_MAX_DAYS for x in mdates)
-            shared = s_ents & m["_ents"]
+            shared = s_ents & g["ents"]
             # A shared name identifies the event only for counterparty-type events (the acquired
             # company, the partner, the product); elsewhere require a shared period token like 'Q3'.
             entity_match = bool(shared) and (s["type"] in C.MERGE_ENTITY_TYPES
@@ -416,17 +738,19 @@ def merge_signals(sigs, exclude=frozenset()):
             if m["type"] == s["type"] and m["level"] == s["level"] and same_time and similar:
                 if s["source_url"] not in m["source_urls"]:
                     m["source_urls"].append(s["source_url"])
+                    g["grew"] = True
                 if d:
                     mdates.append(d)
-                    m["date"] = min(mdates).isoformat()  # earliest report = event date
-                m["_ents"] |= s_ents
+                    new_date = min(mdates).isoformat()  # earliest report = event date
+                    g["grew"] |= new_date != m["date"]
+                    m["date"] = new_date
+                g["ents"] |= s_ents
                 break
         else:
-            merged.append({k: v for k, v in s.items() if k != "source_url"}
-                          | {"source_urls": [s["source_url"]], "_dates": [d] if d else [], "_ents": set(s_ents)})
-    for m in merged:
-        del m["_dates"], m["_ents"]
-    return merged
+            groups.append({"sig": {k: v for k, v in s.items() if k != "source_url"} | {"source_urls": [s["source_url"]]},
+                           "dates": [d] if d else [], "ents": set(s_ents), "old": False, "grew": False})
+    return ([g["sig"] for g in groups if not g["old"]],
+            [g["sig"] for g in groups if g["old"] and g["grew"]])
 
 
 # =============================================================================
@@ -445,24 +769,31 @@ def recency_T(d, today=None):
     return C.UNDATED_T
 
 
-def score_signals(p, signals):
+def compute_score(s):
+    """Code part of the score (needs s["R"]). Rerun when a signal's date changes."""
+    s["T"] = recency_T(s["date"])
+    s["P"] = C.P_PERSON if s["level"] == "person" else C.P_COMPANY
+    s["score"] = round((s["R"] / 3) * (C.W_RECENCY * s["T"] + C.W_PERSONAL * s["P"]), 3)
+    s["passed_gate"] = int(s["R"] >= C.GATE_MIN_R)
+
+
+def rate_signals(p, signals):
+    """LLM relevance R for these signals (one call), then the code score. In place."""
     if not signals:
-        return []
+        return
     listing = "\n".join(f"[{i}] ({s['type']}, {s['level']}, date {s['date'] or 'unknown'}) "
                         f"{s['summary']} | evidence: \"{s['evidence']}\"" for i, s in enumerate(signals))
     sys = PR.RELEVANCE_SYSTEM.format(seller=seller_text(), name=p["name"], role=p["role"], company=p["company"])
     ratings = {r.signal_id: r for r in call_llm(Ratings, sys, PR.RELEVANCE_USER.format(signals=listing)).ratings}
-
     for i, s in enumerate(signals):
         r = ratings.get(i)
         s["R"] = max(0, min(3, int(r.R))) if r else 0
         s["R_reason"] = r.reason if r else "not rated by the LLM (treated as 0)"
-        s["T"] = recency_T(s["date"])
-        s["P"] = C.P_PERSON if s["level"] == "person" else C.P_COMPANY
-        s["score"] = round((s["R"] / 3) * (C.W_RECENCY * s["T"] + C.W_PERSONAL * s["P"]), 3)
-        s["passed_gate"] = int(s["R"] >= C.GATE_MIN_R)
+        compute_score(s)
 
-    # Highest score; ties -> more recent, then person-level.
+
+def rank_signals(signals):
+    """Highest score first; ties -> more recent, then person-level. Sets s["rank"]."""
     def key(s):
         d = parse_date(s["date"])
         return (s["score"], d.toordinal() if d else 0, s["P"])
@@ -470,6 +801,97 @@ def score_signals(p, signals):
     for rank, s in enumerate(ranked, 1):
         s["rank"] = rank
     return ranked
+
+
+# =============================================================================
+# Research rounds 2+ (when no signal passes the gate)
+# =============================================================================
+def research_gaps(signals, n_kept):
+    """Why round so far found no hook. 'no_relevant' always applies when we retry."""
+    gaps = []
+    if n_kept < C.FEW_RESULTS:
+        gaps.append("few_results")
+    if not any(s["level"] == "person" for s in signals):
+        gaps.append("no_person")
+    gaps.append("no_relevant")
+    return gaps
+
+
+def _query_norm(q):
+    return " ".join(q.lower().replace('"', " ").split())
+
+
+def gap_queries(p, gaps, already):
+    """Round 2: fixed templates for the gaps, round-robin across gaps, capped.
+    Templates needing a website are skipped when none was given."""
+    dom = domain_of(p.get("website"))
+    fill = {"name": p["name"], "role": p["role"], "company": p["company"], "domain": dom}
+    per_gap = []
+    for g in gaps:
+        qs = []
+        for t in C.GAP_QUERIES.get(g, []):
+            if "{domain}" in t and not dom:
+                continue
+            q = t.format(**fill)
+            if _query_norm(q) not in already:
+                qs.append({"bucket": "person" if g == "no_person" else "company", "query": q, "gap": g})
+        per_gap.append(qs)
+    out = []
+    while any(per_gap) and len(out) < C.MAX_GAP_QUERIES:
+        for qs in per_gap:
+            if qs and len(out) < C.MAX_GAP_QUERIES:
+                q = qs.pop(0)
+                if _query_norm(q["query"]) not in {_query_norm(x["query"]) for x in out}:
+                    out.append(q)
+    return out
+
+
+def check_planned_query(q, p, previous):
+    """Code guardrails on one LLM-written query. Returns a reject reason, or None."""
+    text = q.strip()
+    if not text:
+        return "empty"
+    if len(text) > C.LLM_QUERY_MAX_CHARS:
+        return f"longer than {C.LLM_QUERY_MAX_CHARS} characters"
+    if not mentions_company(text, p["company"]):
+        return "does not contain the company name"
+    dom = domain_of(p.get("website"))
+    for site in re.findall(r"site:(\S+)", text, re.I):
+        host = domain_of(site.strip('"()'))
+        if not dom or not (host == dom or host.endswith("." + dom)):
+            return f"site: is only allowed for the company's own website ({site})"
+    # Ignore the names (in every query) and search operators when comparing.
+    names = {w.lower() for w in re.findall(r"\w+", f"{p['name']} {p['company']}")} | {"or", "and", "site"}
+    for prev in previous:
+        same_words = set(words(text)) - {"or", "and"} == set(words(prev)) - {"or", "and"}
+        if same_words or jaccard(text, prev, names) >= C.QUERY_DUP_JACCARD:
+            return f"too similar to an earlier query: {prev}"
+    return None
+
+
+def llm_queries(p, all_queries, signals, gaps):
+    """Round 3: the LLM writes new queries from what was found and what is missing;
+    code keeps at most LLM_QUERY_MAX that pass check_planned_query.
+    Returns (accepted, rejected)."""
+    findings = "\n".join(f"- ({s['type']}, {s['level']}, R={s['R']}) {s['summary']} | why: {s['R_reason']}"
+                         for s in signals) or "- nothing usable found"
+    website = f" (website: {p['website']})" if p.get("website") else ""
+    sys = PR.QUERY_PLAN_SYSTEM.format(seller=seller_text(), name=p["name"], role=p["role"], company=p["company"],
+                                      website=website, max_n=C.LLM_QUERY_MAX, max_chars=C.LLM_QUERY_MAX_CHARS)
+    user = PR.QUERY_PLAN_USER.format(queries="\n".join(f"- {q}" for q in all_queries), findings=findings,
+                                     gaps=", ".join(gaps))
+    plan = call_llm(QueryPlan, sys, user).queries
+    accepted, rejected, previous = [], [], list(all_queries)
+    for q in plan:
+        reason = check_planned_query(q.query, p, previous)
+        if reason is None and len(accepted) >= C.LLM_QUERY_MAX:
+            reason = f"over the limit of {C.LLM_QUERY_MAX} queries"
+        if reason:
+            rejected.append({"query": q.query, "reason": q.reason, "rejected": reason})
+            continue
+        accepted.append({"bucket": q.bucket, "query": " ".join(q.query.split()), "reason": q.reason})
+        previous.append(q.query)  # also blocks near-duplicates within the plan
+    return accepted, rejected
 
 
 # =============================================================================
@@ -631,6 +1053,88 @@ def draft_and_check(run_id, p, sig, em, version, replaces=None):
 
 
 # =============================================================================
+# One research round = Stages 3-5
+# =============================================================================
+SIGNAL_TABLE_COLS = ("id", "rank", "round", "type", "level", "summary", "date", "R", "R_reason", "T", "P",
+                     "score", "passed_gate")
+
+
+def research_round(run_id, p, em, rnd, queries, state, more_rounds):
+    """Search (new URLs only), rank, fetch full text, extract, merge into earlier
+    signals, rate the new ones and re-rank all. Updates `state` (seen URLs,
+    signals, kept count) and returns (passing signals best first, round record)."""
+    sfx = "" if rnd == 1 else f" (round {rnd})"
+
+    em.start(3, STAGE_NAMES[3] + sfx)
+    sources, info, errors = gather_sources(queries, p["notes"] if rnd == 1 else "", exclude=state["seen"])
+    cut = info.pop("cut")
+    fetched = fetch_full_text(sources, p) if C.FETCH_TOP_N else {}
+    state["seen"] |= {norm_url(s["url"]) for s in sources + cut}
+    n_search = sum(s["origin"] == "search" for s in sources)
+    state["kept"] += n_search
+    store.add_sources(run_id, [{**s, "round": rnd} for s in sources + cut])  # cut too (kept=0), to tune ranking
+    n_full = sum(v == "ok" for v in fetched.values())
+    summary = (f"{len(queries)} queries -> {info['gathered']} {'new ' if rnd > 1 else ''}results, "
+               f"kept top {n_search}; full text {n_full}/{len(fetched)}")
+    if info["ranking"] and info["ranking"] != "embedding":
+        summary += " (keyword ranking: embedding failed)"
+    if errors:
+        summary += f" ({len(errors)} queries failed)"
+    em.finish(3, "warning" if errors or info["ranking"] != "embedding" else "done", summary,
+              {**info, "errors": errors, "fetched": fetched, "sources": sources, "cut": cut})
+
+    em.start(4, STAGE_NAMES[4] + sfx)
+    new, dropped, grown = extract_signals(p, sources, existing=state["signals"])
+    for s in dropped:
+        s["source_urls"] = [s.pop("source_url")]
+        s["verified"], s["round"] = 0, rnd
+        s["id"] = store.add_signal(run_id, s)
+    for s in new:
+        s["verified"], s["round"] = 1, rnd
+        s["id"] = store.add_signal(run_id, s)
+    for s in grown:  # a new report can make the event date earlier: rescore now (R is unchanged)
+        compute_score(s)
+        store.update_signal(s["id"], source_urls=s["source_urls"], date=s["date"],
+                            **{k: s[k] for k in ("T", "P", "score", "passed_gate")})
+    em.finish(4, "done", f"{len(new) + len(dropped)} new signals, {len(new)} verified"
+                         f"{f', {len(dropped)} dropped' if dropped else ''}"
+                         f"{f', {len(grown)} merged into earlier signals' if grown else ''}",
+              {"verified": new, "dropped": dropped, "merged": grown})
+
+    em.start(5, STAGE_NAMES[5] + sfx)
+    rate_signals(p, new)
+    state["signals"].extend(new)
+    ranked = rank_signals(state["signals"])
+    for s in ranked:
+        store.update_signal(s["id"], **{k: s[k] for k in ("R", "R_reason", "T", "P", "score", "passed_gate", "rank")})
+    passing = [s for s in ranked if s["passed_gate"]]
+    table = [{k: s.get(k) for k in SIGNAL_TABLE_COLS} for s in ranked]
+    if passing:
+        chosen, runner_ups = passing[0], passing[1:1 + C.N_RUNNER_UPS]
+        em.finish(5, "done", f"Hook: {chosen['type']} ({chosen['level']}, round {chosen['round']}), "
+                             f"score {chosen['score']:.2f}",
+                  {"ranked": table, "chosen_id": chosen["id"], "runner_up_ids": [s["id"] for s in runner_ups]})
+    else:
+        nxt = f"research round {rnd + 1}" if more_rounds else "needs_research"
+        em.finish(5, "warning", f"no signal with R >= {C.GATE_MIN_R} -> {nxt}", {"ranked": table})
+    record = {"round": rnd, "queries": len(queries), "results": info["gathered"], "kept": n_search,
+              "full_text": n_full, "new_signals": len(new), "merged": len(grown), "dropped": len(dropped),
+              "passing": len(passing)}
+    return passing, record
+
+
+def plan_round(p, rnd, state):
+    """Stage 2 for round `rnd`. Returns (queries, method, extra payload)."""
+    if rnd == 1:
+        return plan_queries(p), "templates", {}
+    gaps = research_gaps(state["signals"], state["kept"])
+    if rnd == 2:
+        return gap_queries(p, gaps, {_query_norm(q) for q in state["queries"]}), "gap templates", {"gaps": gaps}
+    accepted, rejected = llm_queries(p, state["queries"], state["signals"], gaps)
+    return accepted, "LLM", {"gaps": gaps, "rejected": rejected}
+
+
+# =============================================================================
 # Full pipeline
 # =============================================================================
 def run_pipeline(prospect, on_event=None):
@@ -652,53 +1156,74 @@ def run_pipeline(prospect, on_event=None):
     stage = 1
     try:
         em.start(1)
-        em.finish(1, "done", f"{p['name']}, {p['role']} at {p['company']}",
+        em.finish(1, "done", f"{p['name'] or '(name to find)'}, {p['role'] or '(role to find)'} at {p['company']}",
                   {k: v for k, v in p.items() if v})
 
-        stage = 2
-        em.start(2)
-        queries = plan_queries(p)
-        em.finish(2, "done", f"{len(queries)} queries", {"queries": queries})
+        if not p["name"] or not p["role"]:
+            field = "name" if not p["name"] else "role"
+            label = f"Find prospect {field}"
+            em.start(1, label)
+            value, info = lookup_prospect(p, field)
+            store.update_run(run_id, resolved=lookup_record(info))
+            if value is None:
+                target = (f"the {p['role']} of {p['company']}" if field == "name"
+                          else f"{p['name']}'s role at {p['company']}")
+                msg = f"Could not find {target} in the search results. Add the {field} and run again."
+                em.finish(1, "warning", msg, info, label=label)
+                return end("needs_research", msg)
+            p[field] = value
+            store.update_run(run_id, **{field: value})
+            best, others = info["candidates"][0], [c["value"] for c in info["candidates"][1:]]
+            em.finish(1, "warning" if others else "done",
+                      f"{field}: {value} ({len(best['sources'])} source{'s' * (len(best['sources']) != 1)})"
+                      + (f"; other candidates: {', '.join(others)}" if others else ""),
+                      info, label=label)
 
-        stage = 3
-        em.start(3)
-        sources, counts, errors = gather_sources(queries, p["notes"])
-        store.add_sources(run_id, sources)
-        summary = f"{len(queries)} queries -> {len(sources)} sources"
-        if errors:
-            summary += f" ({len(errors)} queries failed)"
-        em.finish(3, "done", summary, {**counts, "errors": errors, "sources": sources})
+        # Stages 2-5, repeated as research rounds until a signal passes the gate.
+        state = {"seen": set(), "signals": [], "queries": [], "kept": 0}
+        research, passing, stop_reason = [], [], None
+        for rnd in range(1, max(1, C.MAX_RESEARCH_ROUNDS) + 1):
+            more = rnd < C.MAX_RESEARCH_ROUNDS
+            try:
+                stage = 2
+                em.start(2, STAGE_NAMES[2] + ("" if rnd == 1 else f" (round {rnd})"))
+                queries, method, extra = plan_round(p, rnd, state)
+                rej = extra.get("rejected") or []
+                em.finish(2, "done" if queries else "warning",
+                          f"{len(queries)} queries ({method})" + (f", {len(rej)} rejected" if rej else "")
+                          + (f"; gaps: {', '.join(extra['gaps'])}" if extra.get("gaps") else ""),
+                          {"queries": queries, **extra})
+                if not queries:
+                    stop_reason = f"round {rnd}: no new queries to run"
+                    research.append({"round": rnd, "method": method, "queries": 0, **extra})
+                    break
+                state["queries"] += [q["query"] for q in queries]
+                stage = 3
+                passing, record = research_round(run_id, p, em, rnd, queries, state, more)
+                research.append({**record, "method": method, **({"gaps": extra["gaps"]} if "gaps" in extra else {})})
+            except Exception as e:  # StageError, or a bug in a retry round
+                if rnd == 1:
+                    raise  # nothing to fall back on: the run fails as before
+                err = str(e) if isinstance(e, StageError) else f"{type(e).__name__}: {e}"
+                em.fail_open(err)  # a later round failing keeps the run alive with round-1 results
+                stop_reason = f"round {rnd} failed: {err}"
+                research.append({"round": rnd, "error": err})
+                break
+            finally:
+                # Rounds that completed a search (a round with no queries or that failed is in `research` only).
+                store.update_run(run_id, rounds=sum("results" in x for x in research), research=research)
+            if passing:
+                break
 
-        stage = 4
-        em.start(4)
-        signals, dropped = extract_signals(p, sources)
-        for s in dropped:
-            s["source_urls"] = [s.pop("source_url")]
-            s["verified"] = 0
-            s["id"] = store.add_signal(run_id, s)
-        for s in signals:
-            s["verified"] = 1
-            s["id"] = store.add_signal(run_id, s)
-        em.finish(4, "done", f"{len(signals) + len(dropped)} signals extracted, {len(signals)} verified"
-                             f"{f', {len(dropped)} dropped' if dropped else ''}",
-                  {"verified": signals, "dropped": dropped})
-
-        stage = 5
-        em.start(5)
-        ranked = score_signals(p, signals)
-        for s in ranked:
-            store.update_signal(s["id"], **{k: s[k] for k in ("R", "R_reason", "T", "P", "score", "passed_gate", "rank")})
-        passing = [s for s in ranked if s["passed_gate"]]
-        table = [{k: s[k] for k in ("id", "rank", "type", "level", "summary", "date", "R", "R_reason", "T", "P",
-                                    "score", "passed_gate")} for s in ranked]
         if not passing:
-            em.finish(5, "done", f"no signal with R >= {C.GATE_MIN_R} -> needs_research", {"ranked": table})
-            return end("needs_research")
+            msg = (f"No signal reached R >= {C.GATE_MIN_R} after {sum('results' in x for x in research)} "
+                   f"research round(s) "
+                   f"({state['kept']} sources, {len(state['signals'])} signals)."
+                   + (f" {stop_reason[0].upper()}{stop_reason[1:]}." if stop_reason else "")
+                   + " Add notes or a website and run again.")
+            return end("needs_research", msg)
         chosen = passing[0]
-        runner_ups = passing[1:1 + C.N_RUNNER_UPS]
         store.update_run(run_id, chosen_signal_id=chosen["id"])
-        em.finish(5, "done", f"Hook: {chosen['type']} ({chosen['level']}), score {chosen['score']:.2f}",
-                  {"ranked": table, "chosen_id": chosen["id"], "runner_up_ids": [s["id"] for s in runner_ups]})
 
         stage = 6
         _, status = draft_and_check(run_id, p, chosen, em, version=1)
@@ -835,16 +1360,23 @@ def _print_event(ev):
 
 
 if __name__ == "__main__":
-    ap = argparse.ArgumentParser(description="Run the outreach pipeline for one prospect.")
-    ap.add_argument("name")
+    ap = argparse.ArgumentParser(description="Run the outreach pipeline for one prospect. Give --name, "
+                                             "--role or both; the missing one is looked up by search.")
     ap.add_argument("company")
-    ap.add_argument("role")
+    ap.add_argument("--name", default="")
+    ap.add_argument("--role", default="")
     ap.add_argument("--website", default="")
     ap.add_argument("--notes", default="")
     a = ap.parse_args()
+    if validate_input(vars(a)):
+        ap.error(f"required: {', '.join(validate_input(vars(a)))}")
     rid = run_pipeline(vars(a), on_event=_print_event)
     run = store.get_run(rid)
     print(f"\nRun {rid}: {run['status']}" + (f" ({run['error']})" if run["error"] else ""))
+    res = run.get("resolved")
+    if res and res.get("value"):
+        print(f"  {res['field']} found by search (confirm before sending): {res['value']} "
+              f"<- {', '.join(res['sources'])}")
     for s in store.get_signals(rid):
         if s["verified"]:
             print(f"  #{s['rank']} score={s['score']} R={s['R']} T={s['T']} P={s['P']} "

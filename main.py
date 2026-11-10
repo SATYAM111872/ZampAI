@@ -37,20 +37,56 @@ def render_event(ev, box):
                 render_payload(ev["stage"], ev["payload"])
 
 
+def render_lookup(info):
+    st.write("Queries:", [q["query"] for q in info["queries"]])
+    if info.get("errors"):
+        st.error(info["errors"])
+    for c in info.get("candidates", []):
+        mark = "★" if c["value"] == info.get("chosen") else "•"
+        st.markdown(f"{mark} **{c['value']}** — {len(c['sources'])} source(s), latest {c['latest'] or 'undated'}  \n"
+                    f"> {c['evidence'][0]}  \n" + " · ".join(f"[source]({u})" for u in c["sources"]))
+    for c in info.get("dropped", []):
+        st.markdown(f"🚫 ~~{c['value']}~~  \n*Dropped: {c['drop_reason']}*")
+    if not info.get("candidates") and not info.get("dropped"):
+        st.write("No candidates found.")
+    df = pd.DataFrame(info.get("sources") or [])
+    if not df.empty:
+        st.dataframe(df.reindex(columns=["title", "url", "query"]), hide_index=True, width="stretch")
+
+
 def render_payload(stage, payload):
-    if stage == 2:
-        st.dataframe(pd.DataFrame(payload["queries"]), hide_index=True, width="stretch")
+    if stage == 1 and payload.get("field"):
+        render_lookup(payload)
+    elif stage == 2:
+        if payload.get("gaps"):
+            st.write("Gaps from earlier rounds:", ", ".join(payload["gaps"]))
+        if payload.get("queries"):
+            st.dataframe(pd.DataFrame(payload["queries"]), hide_index=True, width="stretch")
+        else:
+            st.write("No new queries.")
+        if payload.get("rejected"):
+            st.write("Rejected LLM queries:")
+            st.dataframe(pd.DataFrame(payload["rejected"]), hide_index=True, width="stretch")
     elif stage == 3:
         st.write("Results per query:", payload.get("per_query"))
         if payload.get("backends"):
             st.write("Search backend used:", payload["backends"])
+        if payload.get("ranking"):
+            st.write("Ranking:", payload["ranking"])
         if payload.get("errors"):
             st.error(payload["errors"])
-        df = pd.DataFrame(payload.get("sources") or [])
+        if payload.get("fetched"):
+            st.write("Full-text fetch:", payload["fetched"])
+        df = pd.DataFrame((payload.get("sources") or []) + (payload.get("cut") or []))
         if df.empty:
             st.write("No sources gathered.")
         else:
-            st.dataframe(df.reindex(columns=["title", "published_date", "url", "query", "origin"]),
+            n_kept = int((df["kept"].fillna(1) == 1).sum()) if "kept" in df else len(df)
+            st.caption(f"Kept {n_kept} of {len(df)}; "
+                       "sim = best similarity to a seller problem or trigger event.")
+            df["full_text"] = df["fulltext"].notna() if "fulltext" in df else False
+            st.dataframe(df.reindex(columns=["kept", "sim", "anchor", "full_text", "title", "published_date", "url",
+                                             "query", "origin"]),
                          hide_index=True, width="stretch")
     elif stage == 4:
         for s in payload.get("verified", []):
@@ -58,7 +94,9 @@ def render_payload(stage, payload):
                         f"> {s['evidence']}  \n" + " · ".join(f"[source]({u})" for u in s["source_urls"]))
         for s in payload.get("dropped", []):
             st.markdown(f"🚫 ~~{s['summary']}~~  \n*Dropped: {s['drop_reason']}*")
-        if not payload.get("verified") and not payload.get("dropped"):
+        for s in payload.get("merged", []):
+            st.markdown(f"🔗 {s['summary']}  \n*New report of an earlier signal; now {len(s['source_urls'])} sources*")
+        if not payload.get("verified") and not payload.get("dropped") and not payload.get("merged"):
             st.write("No signals found.")
     elif stage == 5:
         df = pd.DataFrame(payload["ranked"])
@@ -111,11 +149,15 @@ def replay_timeline(run_id):
 def review_card(run_id, live_parent=None):
     run = store.get_run(run_id)
     st.subheader(f"Review · run {run_id}")
-    st.markdown(f"**{run['name']}**, {run['role']} at **{run['company']}** — status {badge(run['status'])}")
+    st.markdown(f"**{run['name'] or '(name not found)'}**, {run['role'] or '(role not found)'} "
+                f"at **{run['company']}** — status {badge(run['status'])}")
+    res = run.get("resolved")
+    if res and res.get("value"):
+        lookup_notice(res)
 
     if run["status"] == "needs_research":
-        st.info("No signal passed the relevance gate (R ≥ 2), so no draft was written. "
-                "Add notes or a website and run again.")
+        st.info(run["error"] or "No signal passed the relevance gate (R ≥ 2), so no draft was written. "
+                                "Add notes or a website and run again.")
         show_signals_table(run_id)
         return
     if run["status"] == "failed":
@@ -197,11 +239,23 @@ def review_card(run_id, live_parent=None):
         why_this_hook(run_id, d)
 
 
+def lookup_notice(res):
+    n = len(res["sources"])
+    msg = (f"The prospect's **{res['field']}** was not given; web search found **{res['value']}** "
+           f"({n} source{'s' * (n != 1)}, latest {res['latest'] or 'undated'}). Confirm before sending.  \n"
+           f"> {res['evidence']}  \n" + " · ".join(f"[source {i + 1}]({u})" for i, u in enumerate(res["sources"])))
+    if res["alternatives"]:
+        msg += "  \nOther candidates: " + ", ".join(f"{a['value']} ({len(a['sources'])} source(s))"
+                                                    for a in res["alternatives"])
+    st.warning(msg)
+
+
 def why_this_hook(run_id, d):
     sig = store.get_signal(d["signal_id"])
     st.markdown("#### Why this hook")
     if sig:
-        st.markdown(f"**{sig['type']}** · {sig['level']} · {sig['date'] or 'undated'}  \n{sig['summary']}")
+        found_in = f" · found in research round {sig['round']}" if (sig.get("round") or 1) > 1 else ""
+        st.markdown(f"**{sig['type']}** · {sig['level']} · {sig['date'] or 'undated'}{found_in}  \n{sig['summary']}")
         st.markdown(f"> {sig['evidence']}")
         st.markdown(" · ".join(f"[source {i + 1}]({u})" for i, u in enumerate(sig["source_urls"] or [])))
         st.markdown(f"R = **{sig['R']}** ({sig['R_reason']})  \nT = **{sig['T']}** · P = **{sig['P']}** "
@@ -235,13 +289,15 @@ def page_new_run():
     form_col, timeline_col = st.columns([1, 2])
     with form_col:
         with st.form("prospect"):
-            name = st.text_input("Prospect name *")
+            name = st.text_input("Prospect name")
             company = st.text_input("Company *")
-            role = st.text_input("Role / title *")
+            role = st.text_input("Role / title")
             website = st.text_input("Company website (optional)")
             notes = st.text_area("Pasted notes (optional)", height=120,
                                  help="e.g. text copied from the prospect's LinkedIn page")
             submitted = st.form_submit_button("Run", type="primary")
+        st.caption("Give the prospect name, the role, or both; a missing one is looked up by web search. "
+                   "For many prospects use `python batch.py prospects.csv`.")
         st.caption(f"Seller: {C.SELLER_PROFILE['product']} (edit in config.py)")
 
     with timeline_col:
@@ -286,11 +342,13 @@ def page_dashboard():
         hook[r["id"]] = (s["type"], s["score"]) if s else (None, None)
     df["hook_type"] = df["id"].map(lambda i: hook[i][0])
     df["score"] = df["id"].map(lambda i: hook[i][1])
+    df["looked_up"] = df["resolved"].map(
+        lambda r: f"{r['field']}: {'found' if r.get('value') else 'not found'}" if isinstance(r, dict) else "")
 
     statuses = sorted(df["status"].unique())
     pick = st.multiselect("Filter by status", statuses, default=statuses)
-    view = df[df["status"].isin(pick)][["id", "created_at", "name", "company", "status", "hook_type",
-                                        "score", "duration"]]
+    view = df[df["status"].isin(pick)].reindex(columns=["id", "created_at", "name", "company", "role", "looked_up",
+                                                        "status", "rounds", "hook_type", "score", "duration"])
     st.dataframe(view, hide_index=True, width="stretch")
 
     if view.empty:

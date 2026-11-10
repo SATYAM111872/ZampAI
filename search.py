@@ -10,9 +10,13 @@ Each result: url, title, snippet, published_date (ISO or None), query, origin, b
 """
 
 import html
+import ipaddress
 import re
+import socket
 import xml.etree.ElementTree as ET
 from email.utils import parsedate_to_datetime
+from html.parser import HTMLParser
+from urllib.parse import urljoin, urlsplit
 
 import requests
 
@@ -69,6 +73,85 @@ def _bing_web(query):
     items = _rss_items("https://www.bing.com/search", {"q": query, "format": "rss", "count": C.RESULTS_PER_QUERY})
     return [_rec(query, it.findtext("link"), it.findtext("title"), it.findtext("description"), None, "bing-rss")
             for it in items[:C.RESULTS_PER_QUERY]]
+
+
+# ---------------------------------------------------------------------------
+# Full-text fetch (Stage 3): the article text of a result, as paragraphs.
+# ---------------------------------------------------------------------------
+class _Paragraphs(HTMLParser):
+    """Collects visible paragraph-like text; skips scripts, menus, headers, footers."""
+    SKIP = {"script", "style", "noscript", "nav", "header", "footer", "aside", "form", "svg", "button",
+            "template", "iframe"}
+    BLOCK = {"p", "h1", "h2", "h3", "li", "blockquote"}
+
+    def __init__(self):
+        super().__init__(convert_charrefs=True)
+        self.skip, self.cur, self.paras = 0, None, []
+
+    def handle_starttag(self, tag, attrs):
+        if tag in self.SKIP:
+            self.skip += 1
+        elif tag in self.BLOCK and not self.skip:
+            self._flush()
+            self.cur = []
+
+    def handle_endtag(self, tag):
+        if tag in self.SKIP:
+            self.skip = max(0, self.skip - 1)
+        elif tag in self.BLOCK:
+            self._flush()
+
+    def handle_data(self, data):
+        if self.cur is not None and not self.skip:
+            self.cur.append(data)
+
+    def _flush(self):
+        if self.cur:
+            t = " ".join("".join(self.cur).split())
+            if len(t) >= 40:  # drop buttons, bylines, one-word list items
+                self.paras.append(t)
+        self.cur = None
+
+
+def _check_fetch_url(url):
+    """Only public http(s) hosts that are not on the skip list. Checked on every
+    redirect hop, so a result cannot bounce the fetch to localhost or the LAN."""
+    parts = urlsplit(url)
+    host = (parts.hostname or "").lower()
+    if parts.scheme not in ("http", "https") or not host:
+        raise ValueError(f"not an http(s) URL: {url[:100]}")
+    bare = host.removeprefix("www.")
+    if any(bare == h or bare.endswith("." + h) for h in C.FETCH_SKIP_HOSTS):
+        raise ValueError(f"skipped host {host}")
+    for info in socket.getaddrinfo(host, parts.port or (443 if parts.scheme == "https" else 80)):
+        ip = ipaddress.ip_address(info[4][0].split("%")[0])
+        if not ip.is_global:
+            raise ValueError(f"non-public address {ip}")
+
+
+def fetch_paragraphs(url):
+    """GET a page and return its paragraphs. Raises on HTTP errors, non-HTML,
+    non-public hosts or more than 5 redirects."""
+    for _ in range(6):
+        _check_fetch_url(url)
+        r = requests.get(url, headers=_UA, timeout=C.FETCH_TIMEOUT_S, stream=True, allow_redirects=False)
+        if not r.is_redirect:
+            break
+        url = urljoin(url, r.headers.get("location", ""))
+        r.close()
+    else:
+        raise ValueError("too many redirects")
+    with r:
+        r.raise_for_status()
+        if "html" not in r.headers.get("content-type", "").lower():
+            raise ValueError(f"not HTML ({r.headers.get('content-type')})")
+        raw = r.raw.read(C.FETCH_MAX_BYTES, decode_content=True)
+        enc = r.encoding if r.encoding and r.encoding.lower() != "iso-8859-1" else "utf-8"
+    parser = _Paragraphs()
+    parser.feed(raw.decode(enc, errors="replace"))
+    parser.close()
+    parser._flush()
+    return parser.paras
 
 
 def search(q):
