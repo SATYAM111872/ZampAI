@@ -7,4 +7,5 @@ requests==2.34.2
 ddgs==9.16.1
 langchain-core==1.7.6
 langchain-google-genai==4.4.3
+google-genai==2.33.0
 langsmith==0.14.17
