@@ -1,23 +1,27 @@
 """Streamlit UI. Page 1: New run (input form, live stage timeline, review card).
-Page 2: Dashboard (counts, run table, replay of any past run).
+Page 2: Batch (upload a CSV, run every row in the background, download results).
+Page 3: Dashboard (counts, run table, replay of any past run).
 
 Run:  streamlit run main.py
 """
 
+import io
 import json
+import time
 
 import pandas as pd
 import streamlit as st
 
 import agent
+import batch
 import config as C
 import store
 
 st.set_page_config(page_title="Outreach pipeline", layout="wide")
 
 ICON = {"started": "⏳", "done": "✅", "warning": "⚠️", "failed": "❌", "skipped": "⏭️"}
-STATUS_COLOR = {"running": "blue", "drafted": "green", "flagged": "orange", "needs_research": "violet",
-                "failed": "red", "approved": "green", "discarded": "gray"}
+STATUS_COLOR = {"running": "blue", "drafted": "green", "generic": "primary", "flagged": "orange",
+                "needs_research": "violet", "failed": "red", "approved": "green", "discarded": "gray"}
 
 
 def badge(status):
@@ -173,13 +177,17 @@ def review_card(run_id, live_parent=None):
 
     left, right = st.columns([3, 2])
     with left:
-        if run.get("error") and run["status"] in ("drafted", "flagged"):
+        if d.get("kind") == "generic":
+            st.warning("**Generic draft** — research found no personalised hook, so this email speaks to the "
+                       "role only (the generic-fallback switch on the Dashboard is on). Add something specific "
+                       "before sending, or discard it.")
+        if run.get("error") and run["status"] in agent.REVIEWABLE:
             st.warning(run["error"])
         if d["status"] == "flagged":
             st.warning("Draft is flagged: checks failed twice, or a check could not run. "
                        "Review the highlighted items before approving.")
         render_checks(d["check_results"])
-        editable = run["status"] in ("drafted", "flagged")
+        editable = run["status"] in agent.REVIEWABLE
         subject = st.text_input("Subject", agent._pick(d["edited_subject"], d["subject"]), key=f"subj{d['id']}",
                                 disabled=not editable)
         body = st.text_area("Body", agent._pick(d["edited_body"], d["body"]), height=320, key=f"body{d['id']}",
@@ -217,9 +225,13 @@ def review_card(run_id, live_parent=None):
             opts = {s["id"]: f"#{s['rank']} {s['type']} ({s['level']}), score {s['score']:.2f} — {s['summary'][:70]}"
                     for s in gated}
             with st.expander("Regenerate"):
-                sid = st.selectbox("From signal", list(opts), format_func=opts.get,
-                                   index=list(opts).index(d["signal_id"]) if d["signal_id"] in opts else 0,
-                                   key=f"rg_sel{d['id']}")
+                if run["chosen_signal_id"] is None:  # generic run: no signal to choose from
+                    sid = None
+                    st.caption("No signal passed the gate; this writes a new generic draft.")
+                else:
+                    sid = st.selectbox("From signal", list(opts), format_func=opts.get,
+                                       index=list(opts).index(d["signal_id"]) if d["signal_id"] in opts else 0,
+                                       key=f"rg_sel{d['id']}")
                 if st.button("Regenerate draft", key=f"rg{d['id']}"):
                     holder = (live_parent or st).container()
                     with st.spinner("Redrafting... (don't click elsewhere until it finishes)"):
@@ -260,6 +272,10 @@ def why_this_hook(run_id, d):
         st.markdown(" · ".join(f"[source {i + 1}]({u})" for i, u in enumerate(sig["source_urls"] or [])))
         st.markdown(f"R = **{sig['R']}** ({sig['R_reason']})  \nT = **{sig['T']}** · P = **{sig['P']}** "
                     f"→ score **{sig['score']:.2f}**")
+    else:
+        st.markdown("No hook: no signal reached R ≥ 2, so this is a generic, role-based draft. "
+                    "The signals that were found are below.")
+        show_signals_table(run_id)
     others = [s for s in agent.runner_ups(run_id) if s["id"] != d["signal_id"]][:C.N_RUNNER_UPS]
     if others:
         st.markdown("#### Runner-ups")
@@ -296,9 +312,15 @@ def page_new_run():
             notes = st.text_area("Pasted notes (optional)", height=120,
                                  help="e.g. text copied from the prospect's LinkedIn page")
             submitted = st.form_submit_button("Run", type="primary")
-        st.caption("Give the prospect name, the role, or both; a missing one is looked up by web search. "
-                   "For many prospects use `python batch.py prospects.csv`.")
-        st.caption(f"Seller: {C.SELLER_PROFILE['product']} (edit in config.py)")
+        st.caption("Give the prospect name, the role, or both; a missing one is looked up by web search.")
+        job = batch_slot()["job"]
+        if job is not None and job.running:
+            st.warning("A batch is running (Batch page). A single run now competes with it for search "
+                       "rate limits.")
+        st.caption("Generic fallback: **" + ("on" if agent.generic_fallback_on() else "off")
+                   + "** — when no hook is found, " + ("a generic draft is written."
+                   if agent.generic_fallback_on() else "the run stops at needs_research.")
+                   + " Change it on the Dashboard.")
 
     with timeline_col:
         st.markdown("#### Stages")
@@ -321,25 +343,135 @@ def page_new_run():
         review_card(st.session_state["current_run"], live_parent=timeline)
 
 
+@st.cache_resource
+def batch_slot():
+    """One slot per server process, shared by every browser tab: the batch keeps
+    running (and stays visible) across reruns, page switches and reloads."""
+    return {"job": None}
+
+
+def batch_status_counts(results):
+    counts = {}
+    for r in results:
+        counts[r["status"]] = counts.get(r["status"], 0) + 1
+    return ", ".join(f"{n} {s}" for s, n in sorted(counts.items())) or "none yet"
+
+
+def batch_progress(job):
+    results = job.snapshot()
+    done, total = len(results), len(job.rows)
+    st.progress(done / total if total else 1.0, text=f"{done} / {total} rows · {batch_status_counts(results)}")
+    cur = job.current
+    if cur:
+        i, p, t0 = cur
+        who = p["name"] or f"({p['role']})"
+        st.markdown(f"⏳ Row {i}: **{who}** at **{p['company']}** · {time.time() - t0:.0f}s")
+    elif job.running:
+        st.markdown("⏳ Starting…")
+    if job.running:
+        if job.stop_requested:
+            st.caption("Stopping after the current row.")
+        elif st.button("Stop after current row"):
+            job.stop()
+            st.rerun(scope="fragment")
+    else:
+        took = (job.finished or time.time()) - job.started
+        msg = f"Batch {'stopped' if job.stop_requested and done < total else 'finished'}: {done} of {total} rows in {took / 60:.1f} min."
+        st.success(msg + " Review the drafts on the Dashboard.")
+    if results:
+        df = pd.DataFrame(results).reindex(columns=batch.OUT_COLS)
+        st.dataframe(df, hide_index=True, width="stretch")
+        st.download_button("Download results CSV", batch.results_csv(results),
+                           file_name=f"{job.label or 'batch'}_results.csv", mime="text/csv")
+
+
+def page_batch():
+    st.title("Batch")
+    slot = batch_slot()
+    job = slot["job"]
+
+    if job is not None:
+        st.markdown(f"#### {'Running' if job.running else 'Last batch'}: {job.label or 'upload'}")
+        # Polls while the batch runs; only this block reruns, not the whole page.
+        st.fragment(run_every=3 if job.running else None)(batch_progress)(job)
+        if job.running:
+            st.info("The batch runs on the server: you can switch pages or close this tab. "
+                    "Avoid starting single runs meanwhile; parallel searches get rate-limited.")
+            return
+        st.divider()
+
+    st.markdown("#### New batch")
+    st.caption("CSV with a header row: **company** (required), **name**, **role**, **website**, **notes**, in any "
+               "order and any case. Each row needs a name, a role, or both. Rows run one after another "
+               "(about 1–3 minutes each).")
+    up = st.file_uploader("Prospects CSV", type=["csv"])
+    if up is None:
+        return
+    try:
+        rows = batch.parse_rows(io.StringIO(up.getvalue().decode("utf-8-sig")))
+    except UnicodeDecodeError:
+        st.error("Not UTF-8. In Excel, save as 'CSV UTF-8 (Comma delimited)'.")
+        return
+    except ValueError as e:
+        st.error(str(e))
+        return
+    if not rows:
+        st.error("No data rows.")
+        return
+
+    bad = {i: m for i, _, m in batch.invalid_rows(rows)}
+    preview = pd.DataFrame([{"row": i, **p, "problem": f"missing {', '.join(bad[i])}" if i in bad else ""}
+                            for i, p in rows])
+    st.dataframe(preview.reindex(columns=["row", "company", "name", "role", "website", "notes", "problem"]),
+                 hide_index=True, width="stretch")
+    if bad:
+        st.error(f"{len(bad)} invalid row(s): each row needs company plus name or role. Fix the file and upload again.")
+        return
+
+    start = st.number_input("Start at row", min_value=rows[0][0], max_value=rows[-1][0], value=rows[0][0],
+                            help="To resume a stopped batch, start at the first row that did not finish.")
+    todo = [(i, p) for i, p in rows if i >= start]
+    st.caption(f"{len(todo)} row(s) to run. Generic fallback is **{'on' if agent.generic_fallback_on() else 'off'}**"
+               " (change it on the Dashboard).")
+    if st.button(f"Run {len(todo)} row(s)", type="primary"):
+        slot["job"] = batch.BatchJob(todo, label=up.name.rsplit(".", 1)[0]).start()
+        st.rerun()
+
+
+def generic_switch():
+    """On: a run with no usable hook gets a generic, role-based draft. Off: it stops at needs_research.
+    Stored in the database, so batch.py follows it too. Applies to runs started after the change."""
+    on = st.toggle("Generic draft when no hook is found", value=agent.generic_fallback_on(),
+                   help="On: a run whose research finds no signal with R ≥ 2 gets a generic, role-based draft "
+                        "(status 'generic'), marked for review. Off: it stops at needs_research. "
+                        "Applies to new runs, including batch.py.")
+    if on != agent.generic_fallback_on():
+        store.set_setting(agent.GENERIC_SETTING, on)
+        st.toast(f"Generic fallback {'on' if on else 'off'} for new runs")
+
+
 def page_dashboard():
     st.title("Dashboard")
+    generic_switch()
     runs = store.list_runs()
     if not runs:
         st.info("No runs yet.")
         return
     df = pd.DataFrame(runs)
-    c = st.columns(6)
+    c = st.columns(7)
     c[0].metric("Runs", len(df))
-    for col, s in zip(c[1:5], ["drafted", "approved", "flagged", "needs_research"]):
+    for col, s in zip(c[1:6], ["drafted", "generic", "approved", "flagged", "needs_research"]):
         col.metric(s.replace("_", " ").capitalize(), int((df["status"] == s).sum()))
     dur = df["duration"].dropna()
-    c[5].metric("Avg run time", f"{dur.mean():.0f}s" if len(dur) else "–")
+    c[6].metric("Avg run time", f"{dur.mean():.0f}s" if len(dur) else "–")
 
     # hook type + score per run
     hook = {}
     for r in runs:
         s = store.get_signal(r["chosen_signal_id"]) if r["chosen_signal_id"] else None
-        hook[r["id"]] = (s["type"], s["score"]) if s else (None, None)
+        d = None if s else store.current_draft(r["id"])
+        hook[r["id"]] = (s["type"], s["score"]) if s else (("generic", None) if d and d.get("kind") == "generic"
+                                                           else (None, None))
     df["hook_type"] = df["id"].map(lambda i: hook[i][0])
     df["score"] = df["id"].map(lambda i: hook[i][1])
     df["looked_up"] = df["resolved"].map(
@@ -364,5 +496,5 @@ def page_dashboard():
         review_card(rid)
 
 
-page = st.sidebar.radio("Page", ["New run", "Dashboard"])
-page_new_run() if page == "New run" else page_dashboard()
+PAGES = {"New run": page_new_run, "Batch": page_batch, "Dashboard": page_dashboard}
+PAGES[st.sidebar.radio("Page", list(PAGES))]()

@@ -188,6 +188,11 @@ N_RUNNER_UPS = 2
 # ---------------------------------------------------------------------------
 # Stage 6/7 - draft and checks
 # ---------------------------------------------------------------------------
+# Generic fallback: when research ends with no signal passing the gate, write a
+# role-based generic draft instead of stopping at needs_research. This is only the
+# default; the Dashboard toggle stores the live value in the database.
+GENERIC_FALLBACK_DEFAULT = False
+
 BODY_MIN_WORDS = 60
 BODY_MAX_WORDS = 120
 SUBJECT_MAX_WORDS = 8

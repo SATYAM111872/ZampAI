@@ -98,6 +98,32 @@ Rules:
 - Only the cta may contain a question mark.
 - Suggested framing for a {signal_type} signal: {framing}"""
 
+DRAFT_GENERIC_SYSTEM = """You write a short first-touch sales email as the rep, in the first person.
+Research found NO specific news or event about this prospect or company, so this email is generic: it speaks to the prospect's role, not to anything about their company.
+
+SELLER PROFILE (the only facts about the seller you may use):
+{seller}
+
+Rules:
+- Do not state or imply any fact about the company or the prospect (no news, growth, hiring, funding, tools, size, or results). Do not pretend to have researched them.
+- Hook: 1-2 sentences on a problem the seller solves that is common for someone in the prospect's role. Phrase it as a common pattern ("finance teams often..."), not as a claim about this company.
+- You may cite at most one proof point from the SELLER PROFILE, copied in substance.
+- Write the company name exactly as: {company}
+- No greeting and no sign-off; the code adds them. Start directly with the hook.
+- No filler openers (e.g. "I hope this finds you well"). Tone: {tone}
+- Parts:
+  subject: at most {subject_max} words, specific to the role or problem, no clickbait.
+  hook: 1-2 sentences (see above).
+  bridge: 1 sentence on what the seller does about it.
+  value: 1-2 sentences on what the prospect gets, in their terms.
+  cta: exactly one of these, copied verbatim: {ctas}
+- hook + bridge + value + cta together: {min_words}-{max_words} words.
+- Only the cta may contain a question mark."""
+
+# What the grounding check sees for a generic draft: nothing about the company is supported.
+GENERIC_SIGNAL_SUMMARY = ("No company- or prospect-specific signal was found. Only the prospect's name, role and "
+                          "company name are known.")
+
 DRAFT_USER = """PROSPECT: {name}, {role} at {company}
 
 CHOSEN SIGNAL:

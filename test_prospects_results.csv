@@ -1,0 +1,16 @@
+﻿row,run_id,company,name,role,looked_up,status,rounds,subject,error,seconds
+1,17,Zepto,Amit Agarwal,Vice President Data Science,role: found,failed,,,stage 5: LLM timed out after 90s,198.2
+2,18,Zepto,Aadit Palicha,co-founder and CEO,role: found,drafted,1,Scaling finance ops at Zepto,,91.4
+3,19,Razorpay,Harshil Mathur,Co-Founder and CEO,role: found,failed,,,stage 4: LLM timed out after 90s,121.4
+4,20,Zerodha,Nithin Kamath,chief executive officer (CEO),role: found,drafted,1,Scaling Zerodha Fund House finance operations,,175.0
+5,21,Freshworks,Girish Mathrubootham,Founder,role: found,drafted,1,Automating finance operations post-Torii acquisition at Freshworks,,98.9
+6,22,Swiggy,Rahul Bothra,Chief Financial Officer,name: found,drafted,2,Automating finance operations post Lynks Logistics sale,,116.2
+7,23,Zomato,,CFO,name: not found,needs_research,,,Could not find the CFO of Zomato in the search results. Add the name and run again.,6.4
+8,24,Infosys,Jayesh Sanghrajka,Chief Financial Officer,name: found,drafted,1,Infosys acquisition of Stratus and finance operations,,90.4
+9,25,Flipkart,Sriram Venkataraman,Chief Financial Officer,name: found,drafted,2,Scaling Flipkart finance without adding headcount,,221.3
+10,26,Nykaa,P Ganesh,CFO,name: found,drafted,1,Nykaa acquisition and finance operations,,93.0
+11,27,Meesho,Dhiresh Bansal,Chief Financial Officer,name: found,drafted,1,Scaling finance operations at Meesho,,131.2
+12,28,PhonePe,,CFO,name: not found,needs_research,,,Could not find the CFO of PhonePe in the search results. Add the name and run again.,14.5
+13,29,Stripe,Steffan Tomlinson,Chief Financial Officer,name: found,drafted,1,Scaling Stripe finance operations after OpenRouter,,82.3
+14,30,Shopify,Russ Jones,CFO,name: found,drafted,2,Automating finance operations at Shopify,,152.0
+15,31,Delhivery,Vivek Pabari,Head of Finance,name: found,drafted,1,Delhivery finance operations and volume scaling,,111.7

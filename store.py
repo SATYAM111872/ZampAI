@@ -39,18 +39,20 @@ CREATE TABLE IF NOT EXISTS drafts (
     run_id INTEGER, signal_id INTEGER, version INTEGER, attempt INTEGER,
     subject TEXT, hook TEXT, bridge TEXT, value TEXT, cta TEXT, body TEXT,
     check_results TEXT, status TEXT, edited_subject TEXT, edited_body TEXT,
-    created_at TEXT
+    created_at TEXT, kind TEXT
 );
 CREATE TABLE IF NOT EXISTS review_actions (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     run_id INTEGER, draft_id INTEGER, action TEXT, reason TEXT, at TEXT
 );
+CREATE TABLE IF NOT EXISTS settings (key TEXT PRIMARY KEY, value TEXT);
 """
 
 MIGRATIONS = {"runs": {"resolved": "TEXT", "rounds": "INTEGER", "research": "TEXT"},
               "sources": {"bucket": "TEXT", "sim": "REAL", "anchor": "TEXT", "kept": "INTEGER",
                           "round": "INTEGER", "fulltext": "TEXT"},
-              "signals": {"round": "INTEGER"}}
+              "signals": {"round": "INTEGER"},
+              "drafts": {"kind": "TEXT"}}
 
 JSON_COLS = {"payload", "source_urls", "check_results", "resolved", "research"}
 
@@ -213,3 +215,15 @@ def add_review_action(run_id, draft_id, action, reason=""):
 
 def get_review_actions(run_id):
     return _select("SELECT * FROM review_actions WHERE run_id = ? ORDER BY id", (run_id,))
+
+
+# --- settings (switches the Dashboard changes; shared with batch.py) ---------
+def get_setting(key, default=None):
+    rows = _select("SELECT value FROM settings WHERE key = ?", (key,))
+    return json.loads(rows[0]["value"]) if rows else default
+
+
+def set_setting(key, value):
+    with _conn() as con:
+        con.execute("INSERT INTO settings (key, value) VALUES (?, ?) "
+                    "ON CONFLICT(key) DO UPDATE SET value = excluded.value", (key, json.dumps(value)))

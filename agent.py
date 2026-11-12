@@ -13,7 +13,7 @@ import argparse
 import json
 import re
 import time
-from concurrent.futures import ThreadPoolExecutor, TimeoutError as FutTimeout
+from concurrent.futures import TimeoutError as FutTimeout
 from datetime import date, datetime, timezone
 from typing import Literal, Optional
 from urllib.parse import urlsplit, urlunsplit
@@ -25,12 +25,19 @@ import prompts as PR
 import store
 from llm import embeddings, llm
 from search import fetch_paragraphs, search as search_tool
+from tracing import Pool, step, tag_current
+
+# Searches and page fetches as tool steps in a LangSmith trace (no-op when tracing is off).
+search_tool = step("search", "tool")(search_tool)
+fetch_paragraphs = step("fetch page", "tool")(fetch_paragraphs)
 
 store.init_db()
 
 STAGE_NAMES = {1: "Input", 2: "Plan queries", 3: "Gather sources", 4: "Extract signals",
                5: "Score & pick hook", 6: "Draft", 7: "Check draft", 8: "Review"}
-TERMINAL = {"drafted", "flagged", "needs_research", "failed", "approved", "discarded"}
+TERMINAL = {"drafted", "generic", "flagged", "needs_research", "failed", "approved", "discarded"}
+REVIEWABLE = ("drafted", "generic", "flagged")
+GENERIC_SETTING = "generic_fallback"  # Dashboard switch, stored in the settings table
 NOTES_URL = "rep-notes://pasted"
 
 
@@ -104,7 +111,7 @@ class Grounding(BaseModel):
     claims: list[Claim]
 
 
-_llm_pool = ThreadPoolExecutor(max_workers=4)
+_llm_pool = Pool(max_workers=4)
 
 
 _TRANSIENT = ("503", "429", "UNAVAILABLE", "RESOURCE_EXHAUSTED", "overloaded", "high demand")
@@ -343,6 +350,7 @@ def _check_candidate(c, field, p, src):
     return None
 
 
+@step('lookup prospect')
 def lookup_prospect(p, field):
     """Find the missing name (field='name') or role (field='role') by web search.
     Returns (value or None, info); info lists every candidate and drop reason.
@@ -411,6 +419,7 @@ def plan_queries(p):
 # =============================================================================
 # Stage 3 - Gather sources (search tool)
 # =============================================================================
+@step('gather sources')
 def gather_sources(queries, notes, rank=True, exclude=frozenset()):
     """Run the queries, dedupe the results and (rank=True) keep the top
     MAX_SOURCES by similarity to the seller (see rank_sources). Pasted notes are
@@ -418,7 +427,7 @@ def gather_sources(queries, notes, rank=True, exclude=frozenset()):
     Returns (kept sources, info, errors); info["cut"] holds the results that
     were scored but not kept."""
     per_query, errors = {}, {}
-    pool = ThreadPoolExecutor(max_workers=C.SEARCH_WORKERS)
+    pool = Pool(max_workers=C.SEARCH_WORKERS)
     try:
         futs = {q["query"]: pool.submit(search_tool, q) for q in queries}
         # Each query may walk up to 4 backends; bound the whole stage.
@@ -514,6 +523,7 @@ def _keyword_scores(anchors, texts):
     return out
 
 
+@step('rank sources')
 def rank_sources(pool):
     """Score every result against the anchors (seller problems + trigger events)
     and keep the top MAX_SOURCES, always including the best MIN_PERSON_SOURCES
@@ -569,6 +579,7 @@ def page_excerpt(paras, p, limit=None):
     return " ".join(out)[:limit]
 
 
+@step('fetch full text')
 def fetch_full_text(sources, p):
     """Fetch the pages of the top FETCH_TOP_N fetchable sources (already in rank
     order) and set s["fulltext"]. Failures leave the snippet in place.
@@ -577,7 +588,7 @@ def fetch_full_text(sources, p):
     if not targets:
         return {}
     status = {}
-    pool = ThreadPoolExecutor(max_workers=len(targets))
+    pool = Pool(max_workers=len(targets))
     try:
         futs = {s["url"]: (s, pool.submit(fetch_paragraphs, s["url"])) for s in targets}
         deadline = time.time() + C.FETCH_TIMEOUT_S * 2
@@ -661,6 +672,7 @@ def _mentions_person(text, name, full_name_only=False):
     return not full_name_only and len(parts) >= 2 and _has_word(t, parts[0]) and _has_word(t, parts[-1])
 
 
+@step('extract signals')
 def extract_signals(p, sources, existing=()):
     """Returns (new signals, dropped, grown). `existing` = verified signals from
     earlier research rounds: a new report of the same event is merged into it
@@ -777,6 +789,7 @@ def compute_score(s):
     s["passed_gate"] = int(s["R"] >= C.GATE_MIN_R)
 
 
+@step('rate signals')
 def rate_signals(p, signals):
     """LLM relevance R for these signals (one call), then the code score. In place."""
     if not signals:
@@ -869,6 +882,7 @@ def check_planned_query(q, p, previous):
     return None
 
 
+@step('LLM queries')
 def llm_queries(p, all_queries, signals, gaps):
     """Round 3: the LLM writes new queries from what was found and what is missing;
     code keeps at most LLM_QUERY_MAX that pass check_planned_query.
@@ -897,12 +911,25 @@ def llm_queries(p, all_queries, signals, gaps):
 # =============================================================================
 # Stage 6 - Draft (LLM)
 # =============================================================================
+def generic_fallback_on():
+    """The Dashboard switch: write a generic draft instead of stopping at needs_research."""
+    return bool(store.get_setting(GENERIC_SETTING, C.GENERIC_FALLBACK_DEFAULT))
+
+
 def draft_email(p, sig, failures=None, previous=None):
+    """sig=None writes the generic (role-based, no-signal) draft."""
     s = C.SELLER_PROFILE
     feedback = ""
     if failures:
         feedback = PR.DRAFT_FEEDBACK.format(failures="\n".join(f"- {f}" for f in failures),
                                             previous=json.dumps(previous, indent=2))
+    if sig is None:
+        sys = PR.DRAFT_GENERIC_SYSTEM.format(seller=seller_text(), company=p["company"], tone=s["tone"],
+                                             subject_max=C.SUBJECT_MAX_WORDS, ctas=" | ".join(s["allowed_ctas"]),
+                                             min_words=C.BODY_MIN_WORDS, max_words=C.BODY_MAX_WORDS)
+        user = f"PROSPECT: {p['name']}, {p['role'] or 'role unknown'} at {p['company']}\n{feedback}"
+        parts = call_llm(DraftParts, sys, user).model_dump()
+        return parts, assemble(p, parts)
     sys = PR.DRAFT_SYSTEM.format(seller=seller_text(), company=p["company"], tone=s["tone"],
                                  subject_max=C.SUBJECT_MAX_WORDS, ctas=" | ".join(s["allowed_ctas"]),
                                  min_words=C.BODY_MIN_WORDS, max_words=C.BODY_MAX_WORDS,
@@ -921,6 +948,7 @@ def _norm_phrase(s):
     return " ".join(words(s))
 
 
+@step('check draft')
 def check_draft(p, sig, parts, body):
     checks = []
     core = core_text(parts)
@@ -968,7 +996,8 @@ def check_draft(p, sig, parts, body):
 
     try:
         g = call_llm(Grounding, PR.GROUNDING_SYSTEM, PR.GROUNDING_USER.format(
-            summary=sig["summary"], evidence=sig["evidence"], date=sig["date"] or "unknown",
+            summary=sig["summary"] if sig else PR.GENERIC_SIGNAL_SUMMARY,
+            evidence=sig["evidence"] if sig else "", date=(sig and sig["date"]) or "unknown",
             name=p["name"], role=p["role"], company=p["company"], seller=seller_text(),
             subject=parts["subject"], body=body))
         unsupported = [c.claim for c in g.claims if not c.supported]
@@ -999,6 +1028,7 @@ def _edit1(a, b):
 # =============================================================================
 # Stages 6 + 7 loop (shared by the pipeline and Regenerate)
 # =============================================================================
+@step('draft and check')
 def draft_and_check(run_id, p, sig, em, version, replaces=None):
     """Draft, check, redraft once on failure. Returns (draft_id, status).
 
@@ -1006,10 +1036,13 @@ def draft_and_check(run_id, p, sig, em, version, replaces=None):
     marked superseded only once a new draft exists, so a failed regenerate
     leaves the old draft reviewable.
     Raises StageError only if the FIRST draft cannot be written. If a redraft
-    errors, the previous (failed-check) draft is kept and flagged."""
+    errors, the previous (failed-check) draft is kept and flagged.
+    sig=None writes a generic draft (no signal); the draft is stored with kind 'generic'."""
     failures, previous, draft_id = None, None, None
+    kind = "generic" if sig is None else "personalised"
+    tag = "generic, " if sig is None else ""
     for attempt in range(1, C.MAX_DRAFT_ATTEMPTS + 1):
-        label6 = f"Draft (v{version}, attempt {attempt})"
+        label6 = f"Draft ({tag}v{version}, attempt {attempt})"
         em.start(6, label6)
         try:
             parts, body = draft_email(p, sig, failures, previous)
@@ -1020,14 +1053,15 @@ def draft_and_check(run_id, p, sig, em, version, replaces=None):
             store.update_draft(draft_id, status="flagged")  # keep the attempt-1 draft for review
             return draft_id, "flagged"
         prior = draft_id or replaces
-        draft_id = store.add_draft({"run_id": run_id, "signal_id": sig["id"], "version": version,
-                                    "attempt": attempt, **parts, "body": body, "status": "checking"})
+        draft_id = store.add_draft({"run_id": run_id, "signal_id": sig["id"] if sig else None,
+                                    "version": version, "attempt": attempt, **parts, "body": body,
+                                    "status": "checking", "kind": kind})
         if prior:
             store.update_draft(prior, status="superseded")
         em.finish(6, "done", f"\"{parts['subject']}\" - {word_count(core_text(parts))} words",
                   {"subject": parts["subject"], "body": body, "parts": parts}, label=label6)
 
-        label7 = f"Check draft (v{version}, attempt {attempt})"
+        label7 = f"Check draft ({tag}v{version}, attempt {attempt})"
         em.start(7, label7)
         checks = check_draft(p, sig, parts, body)
         failed = [c for c in checks if c["passed"] is False]
@@ -1059,6 +1093,7 @@ SIGNAL_TABLE_COLS = ("id", "rank", "round", "type", "level", "summary", "date", 
                      "score", "passed_gate")
 
 
+@step('research round')
 def research_round(run_id, p, em, rnd, queries, state, more_rounds):
     """Search (new URLs only), rank, fetch full text, extract, merge into earlier
     signals, rate the new ones and re-rank all. Updates `state` (seen URLs,
@@ -1123,6 +1158,7 @@ def research_round(run_id, p, em, rnd, queries, state, more_rounds):
     return passing, record
 
 
+@step('plan queries')
 def plan_round(p, rnd, state):
     """Stage 2 for round `rnd`. Returns (queries, method, extra payload)."""
     if rnd == 1:
@@ -1137,9 +1173,11 @@ def plan_round(p, rnd, state):
 # =============================================================================
 # Full pipeline
 # =============================================================================
+@step('prospect')
 def run_pipeline(prospect, on_event=None):
     """Runs Stages 1-7. Returns the run id. Final status is one of
-    drafted / flagged / needs_research / failed."""
+    drafted / generic / flagged / needs_research / failed ('generic' only when the
+    Dashboard's generic-fallback switch is on and no signal passed the gate)."""
     p = {k: (prospect.get(k) or "").strip() for k in ("name", "company", "role", "website", "notes")}
     missing = validate_input(p)
     if missing:
@@ -1148,9 +1186,11 @@ def run_pipeline(prospect, on_event=None):
     t_run = time.time()
     run_id = store.create_run(p)
     em = Emitter(run_id, on_event)
+    tag_current(run_id=run_id, company=p["company"], prospect=p["name"] or None, role=p["role"] or None)
 
     def end(status, error=None):
         store.update_run(run_id, status=status, duration=round(time.time() - t_run, 1), error=error)
+        tag_current(status=status, error=error)
         return run_id
 
     stage = 1
@@ -1221,7 +1261,13 @@ def run_pipeline(prospect, on_event=None):
                    f"({state['kept']} sources, {len(state['signals'])} signals)."
                    + (f" {stop_reason[0].upper()}{stop_reason[1:]}." if stop_reason else "")
                    + " Add notes or a website and run again.")
-            return end("needs_research", msg)
+            if not generic_fallback_on():
+                return end("needs_research", msg)
+            # Generic fallback (Dashboard switch on): a role-based draft, clearly marked as not personalised.
+            stage = 6
+            _, status = draft_and_check(run_id, p, None, em, version=1)
+            return end("generic" if status == "drafted" else "flagged",
+                       "Generic draft: no personalised hook was found. " + msg)
         chosen = passing[0]
         store.update_run(run_id, chosen_signal_id=chosen["id"])
 
@@ -1253,7 +1299,7 @@ def runner_ups(run_id):
 
 
 def _reviewable(run):
-    if run["status"] not in ("drafted", "flagged"):
+    if run["status"] not in REVIEWABLE:
         raise ValueError(f"run {run['id']} is '{run['status']}', not reviewable")
 
 
@@ -1294,6 +1340,7 @@ def discard(run_id, reason):
     store.add_review_action(run_id, d["id"], "discard", reason)
 
 
+@step('regenerate')
 def regenerate(run_id, signal_id=None, on_event=None):
     """Redraft from the same signal, or from a runner-up the rep picks.
     Returns (status, error). If drafting fails, the old draft stays current and
@@ -1301,12 +1348,16 @@ def regenerate(run_id, signal_id=None, on_event=None):
     run = store.get_run(run_id)
     _reviewable(run)
     old = store.current_draft(run_id)
-    sig = store.get_signal(signal_id or run["chosen_signal_id"])
-    allowed = {s["id"] for s in runner_ups(run_id)}
-    if sig is None or sig["id"] not in allowed:
-        raise ValueError("signal must be the chosen hook or one of its runner-ups")
+    if signal_id is None and run["chosen_signal_id"] is None:
+        sig = None  # a generic run (no signal passed the gate): redraft the generic email
+    else:
+        sig = store.get_signal(signal_id or run["chosen_signal_id"])
+        allowed = {s["id"] for s in runner_ups(run_id)}
+        if sig is None or sig["id"] not in allowed:
+            raise ValueError("signal must be the chosen hook or one of its runner-ups")
+    sig_id = sig["id"] if sig else None
     p = {k: run[k] for k in ("name", "company", "role", "website", "notes")}
-    store.add_review_action(run_id, old["id"], "regenerate", f"signal {sig['id']}")
+    store.add_review_action(run_id, old["id"], "regenerate", f"signal {sig_id}" if sig else "generic")
     version = max(d["version"] for d in store.get_drafts(run_id)) + 1
     store.update_run(run_id, status="running")
     em = Emitter(run_id, on_event)
@@ -1330,12 +1381,15 @@ def regenerate(run_id, signal_id=None, on_event=None):
         cur = store.current_draft(run_id)
         if cur and cur["id"] != old["id"]:  # a new draft was written before the interrupt
             store.update_draft(cur["id"], status="flagged")
-            store.update_run(run_id, status="flagged", chosen_signal_id=sig["id"])
+            store.update_run(run_id, status="flagged", chosen_signal_id=sig_id)
             em.fail_open("interrupted")
         else:
             restore("interrupted")
         raise
-    store.update_run(run_id, status=status, chosen_signal_id=sig["id"], error=None,
+    if sig is None and status == "drafted":
+        status = "generic"
+    store.update_run(run_id, status=status, chosen_signal_id=sig_id,
+                     error=run["error"] if sig is None else None,  # keep the "why generic" note
                      duration=round((run["duration"] or 0) + time.time() - t, 1))
     return status, None
 
